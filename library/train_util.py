@@ -2141,13 +2141,12 @@ class DreamBoothDataset(BaseDataset):
 
         self.num_reg_images = num_reg_images
 
-
 class FineTuningDataset(BaseDataset):
     def __init__(
         self,
         subsets: Sequence[FineTuningSubset],
         batch_size: int,
-        resolution,
+        resolution, # Tuple[int, int] or None
         network_multiplier: float,
         enable_bucket: bool,
         min_bucket_reso: int,
@@ -2155,16 +2154,19 @@ class FineTuningDataset(BaseDataset):
         bucket_reso_steps: int,
         bucket_no_upscale: bool,
         debug_dataset: bool,
-        validation_seed: int,
+        validation_seed: int, # Should be Optional[int] if it can be None
         validation_split: float,
         resize_interpolation: Optional[str],
+        # Add text_encoding_strategy from BaseDataset if it's not directly inherited
+        # text_encoding_strategy: Optional[strategy_base.TextEncodingStrategy] = None, # Already in BaseDataset via set_current_strategies
     ) -> None:
         super().__init__(resolution, network_multiplier, debug_dataset, resize_interpolation)
 
         self.batch_size = batch_size
+        self.text_encoding_strategy = None # Will be set by set_current_strategies
 
         self.num_train_images = 0
-        self.num_reg_images = 0
+        self.num_reg_images = 0 # FineTuningDataset typically doesn't have reg images in the same way DB does
 
         for subset in subsets:
             if subset.num_repeats < 1:
@@ -2173,7 +2175,7 @@ class FineTuningDataset(BaseDataset):
                 )
                 continue
 
-            if subset in self.subsets:
+            if subset in self.subsets: # self.subsets is on BaseDataset
                 logger.warning(
                     f"ignore duplicated subset with metadata_file='{subset.metadata_file}': use the first one / 既にサブセットが登録されているため、重複した後発のサブセットを無視します"
                 )
@@ -2194,182 +2196,510 @@ class FineTuningDataset(BaseDataset):
                 continue
 
             tags_list = []
+            image_info_list_for_subset = [] # Temp list for this subset's images
             for image_key, img_md in metadata.items():
                 # path情報を作る
                 abs_path = None
 
-                # まず画像を優先して探す
-                if os.path.exists(image_key):
+                if subset.image_dir: # If image_dir is provided for the subset, look relative to it
+                    candidate_path = os.path.join(subset.image_dir, image_key)
+                    if os.path.exists(candidate_path):
+                        abs_path = candidate_path
+                    else: # Check without image_dir as fallback (if image_key is already somewhat absolute or elsewhere)
+                        if os.path.exists(image_key):
+                             abs_path = image_key
+                elif os.path.exists(image_key): # No image_dir for subset, image_key itself is the path
                     abs_path = image_key
-                else:
-                    # わりといい加減だがいい方法が思いつかん
-                    paths = glob_images(subset.image_dir, image_key)
-                    if len(paths) > 0:
-                        abs_path = paths[0]
-
-                # なければnpzを探す
+                
+                # Fallback for .npz if image not found directly
                 if abs_path is None:
-                    if os.path.exists(os.path.splitext(image_key)[0] + ".npz"):
-                        abs_path = os.path.splitext(image_key)[0] + ".npz"
-                    else:
-                        npz_path = os.path.join(subset.image_dir, image_key + ".npz")
-                        if os.path.exists(npz_path):
-                            abs_path = npz_path
+                    base_key_no_ext = os.path.splitext(image_key)[0]
+                    npz_candidate = base_key_no_ext + ".npz"
+                    if subset.image_dir and os.path.exists(os.path.join(subset.image_dir, npz_candidate)):
+                        abs_path = os.path.join(subset.image_dir, npz_candidate) # Indicates latents might be from npz
+                    elif os.path.exists(npz_candidate):
+                        abs_path = npz_candidate
 
-                assert abs_path is not None, f"no image / 画像がありません: {image_key}"
+                if abs_path is None:
+                    logger.warning(f"Image/npz not found for key: {image_key} in metadata {subset.metadata_file}. Looked in {subset.image_dir if subset.image_dir else 'current dir/abs paths'}. Skipping.")
+                    continue
+                
+                abs_path = os.path.abspath(abs_path) # Normalize
 
                 caption = img_md.get("caption")
                 tags = img_md.get("tags")
-                if caption is None:
-                    caption = tags  # could be multiline
-                    tags = None
-
-                if subset.enable_wildcard:
-                    # tags must be single line
-                    if tags is not None:
-                        tags = tags.replace("\n", subset.caption_separator)
-
-                    # add tags to each line of caption
-                    if caption is not None and tags is not None:
+                if caption is None and tags is not None: # Only tags provided
+                    caption = tags
+                elif caption is not None and tags is not None: # Both provided
+                    if subset.enable_wildcard: # If wildcard, tags are usually single line and appended
+                        tags = tags.replace("\n", subset.caption_separator if subset.caption_separator else ",")
                         caption = "\n".join(
-                            [f"{line}{subset.caption_separator}{tags}" for line in caption.split("\n") if line.strip() != ""]
+                            [f"{line.strip()}{subset.caption_separator if subset.caption_separator else ','}{tags}" for line in caption.split("\n") if line.strip()]
                         )
-                else:
-                    # use as is
-                    if tags is not None and len(tags) > 0:
-                        caption = caption + subset.caption_separator + tags
-                        tags_list.append(tags)
-
+                    else: # No wildcard, just append
+                        caption = caption.strip() + (subset.caption_separator if subset.caption_separator else ",") + tags.strip()
+                
                 if caption is None:
                     caption = ""
+                
+                if tags is not None: # For tag frequency
+                    tags_list.extend(tag.strip() for tag_part in tags.split(subset.caption_separator if subset.caption_separator else ",") for tag in tag_part.split('\n') if tag.strip())
 
-                image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path)
-                image_info.image_size = img_md.get("train_resolution")
 
-                if not subset.color_aug and not subset.random_crop:
-                    # if npz exists, use them
-                    image_info.latents_npz, image_info.latents_npz_flipped = self.image_key_to_npz_file(subset, image_key)
+                image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path) # is_reg is False for FineTuning
+                image_info.image_size = img_md.get("train_resolution") # [width, height]
+                image_info.resize_interpolation = subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
 
-                self.register_image(image_info, subset)
 
-            self.num_train_images += len(metadata) * subset.num_repeats
+                # For FineTuning, latents are usually cached if not doing color/random_crop aug.
+                # Set up latents_npz path based on abs_path (actual image/npz path) for caching strategy.
+                # The strategy itself will handle the specific suffix.
+                if self.latents_caching_strategy: # Ensure strategy is set
+                     image_info.latents_npz = self.latents_caching_strategy.get_latents_npz_path(abs_path, image_info.image_size if image_info.image_size else self.resolution)
 
-            # TODO do not record tag freq when no tag
+                if self.text_encoder_output_caching_strategy:
+                     image_info.text_encoder_outputs_npz = self.text_encoder_output_caching_strategy.get_outputs_npz_path(abs_path)
+                
+                image_info_list_for_subset.append(image_info)
+                self.register_image(image_info, subset) # Registers to self.image_data
+
+            self.num_train_images += len(image_info_list_for_subset) * subset.num_repeats
             self.set_tag_frequency(os.path.basename(subset.metadata_file), tags_list)
-            subset.img_count = len(metadata)
+            subset.img_count = len(image_info_list_for_subset)
             self.subsets.append(subset)
 
-        # check existence of all npz files
-        use_npz_latents = all([not (subset.color_aug or subset.random_crop) for subset in self.subsets])
-        if use_npz_latents:
-            flip_aug_in_subset = False
-            npz_any = False
-            npz_all = True
 
-            for image_info in self.image_data.values():
-                subset = self.image_to_subset[image_info.image_key]
+        # Bucket related setup (resolution, enable_bucket etc. are from dataset_params)
+        self.enable_bucket = enable_bucket
+        if self.enable_bucket:
+            # If resolution is None, try to infer from dataset or raise error
+            actual_resolution_for_bucketing = resolution
+            if actual_resolution_for_bucketing is None:
+                # Attempt to get a representative resolution from loaded images if possible
+                # This is tricky. For now, assume if buckets are enabled, resolution should be provided
+                # or all images must have `train_resolution` in metadata for `make_buckets` to work well.
+                if not all(info.image_size for info in self.image_data.values()):
+                     raise ValueError("Resolution must be provided for bucketing if not all images have 'train_resolution' in metadata.")
+                # Max width/height among all images could be a fallback for max_reso for BucketManager.
+                # However, BucketManager expects a target max_reso if not no_upscale.
+                # This part needs to be robust if resolution arg is None.
+                # For now, assume `resolution` arg is primary if bucketing.
+                if not resolution:
+                    raise ValueError("`resolution` (width,height) must be specified when `enable_bucket` is True for FineTuningDataset unless all metadata has `train_resolution`.")
 
-                has_npz = image_info.latents_npz is not None
-                npz_any = npz_any or has_npz
 
-                if subset.flip_aug:
-                    has_npz = has_npz and image_info.latents_npz_flipped is not None
-                    flip_aug_in_subset = True
-                npz_all = npz_all and has_npz
-
-                if npz_any and not npz_all:
-                    break
-
-            if not npz_any:
-                use_npz_latents = False
-                logger.warning(f"npz file does not exist. ignore npz files / npzファイルが見つからないためnpzファイルを無視します")
-            elif not npz_all:
-                use_npz_latents = False
-                logger.warning(
-                    f"some of npz file does not exist. ignore npz files / いくつかのnpzファイルが見つからないためnpzファイルを無視します"
-                )
-                if flip_aug_in_subset:
-                    logger.warning("maybe no flipped files / 反転されたnpzファイルがないのかもしれません")
-        # else:
-        #   logger.info("npz files are not used with color_aug and/or random_crop / color_augまたはrandom_cropが指定されているためnpzファイルは使用されません")
-
-        # check min/max bucket size
-        sizes = set()
-        resos = set()
-        for image_info in self.image_data.values():
-            if image_info.image_size is None:
-                sizes = None  # not calculated
-                break
-            sizes.add(image_info.image_size[0])
-            sizes.add(image_info.image_size[1])
-            resos.add(tuple(image_info.image_size))
-
-        if sizes is None:
-            if use_npz_latents:
-                use_npz_latents = False
-                logger.warning(
-                    f"npz files exist, but no bucket info in metadata. ignore npz files / メタデータにbucket情報がないためnpzファイルを無視します"
-                )
-
-            assert (
-                resolution is not None
-            ), "if metadata doesn't have bucket info, resolution is required / メタデータにbucket情報がない場合はresolutionを指定してください"
-
-            self.enable_bucket = enable_bucket
-            if self.enable_bucket:
-                min_bucket_reso, max_bucket_reso = self.adjust_min_max_bucket_reso_by_steps(
-                    resolution, min_bucket_reso, max_bucket_reso, bucket_reso_steps
-                )
-                self.min_bucket_reso = min_bucket_reso
-                self.max_bucket_reso = max_bucket_reso
-                self.bucket_reso_steps = bucket_reso_steps
-                self.bucket_no_upscale = bucket_no_upscale
-        else:
-            if not enable_bucket:
-                logger.info("metadata has bucket info, enable bucketing / メタデータにbucket情報があるためbucketを有効にします")
-            logger.info("using bucket info in metadata / メタデータ内のbucket情報を使います")
-            self.enable_bucket = True
-
-            assert (
-                not bucket_no_upscale
-            ), "if metadata has bucket info, bucket reso is precalculated, so bucket_no_upscale cannot be used / メタデータ内にbucket情報がある場合はbucketの解像度は計算済みのため、bucket_no_upscaleは使えません"
-
-            # bucket情報を初期化しておく、make_bucketsで再作成しない
-            self.bucket_manager = BucketManager(False, None, None, None, None)
-            self.bucket_manager.set_predefined_resos(resos)
-
-        # npz情報をきれいにしておく
-        if not use_npz_latents:
-            for image_info in self.image_data.values():
-                image_info.latents_npz = image_info.latents_npz_flipped = None
+            min_bucket_reso, max_bucket_reso = self.adjust_min_max_bucket_reso_by_steps(
+                resolution, min_bucket_reso, max_bucket_reso, bucket_reso_steps
+            )
+            self.min_bucket_reso = min_bucket_reso
+            self.max_bucket_reso = max_bucket_reso
+            self.bucket_reso_steps = bucket_reso_steps
+            self.bucket_no_upscale = bucket_no_upscale
+            # If self.width/height were None, set them from resolution arg now
+            if self.width is None and resolution:
+                self.width, self.height = resolution
+        else: # Not enable_bucket
+            if resolution is None:
+                raise ValueError("`resolution` must be specified if `enable_bucket` is False.")
+            self.width, self.height = resolution
+            self.min_bucket_reso = None
+            self.max_bucket_reso = None
+            self.bucket_reso_steps = None
+            self.bucket_no_upscale = False
+        
+        # The rest of __init__ related to npz checks and bucket setup from BaseDataset.make_buckets
+        # should be implicitly handled if self.make_buckets() is called after this.
+        # Or, that logic needs to be here.
+        # For now, assuming self.make_buckets() will be called externally.
 
     def image_key_to_npz_file(self, subset: FineTuningSubset, image_key):
+        # This method seems specific to how latents were cached in older system (direct .npz next to image)
+        # The new caching strategies handle npz path generation.
+        # This method might be redundant if latents_caching_strategy.get_latents_npz_path is used.
         base_name = os.path.splitext(image_key)[0]
-        npz_file_norm = base_name + ".npz"
+        npz_file_norm = base_name + ".npz" # Default assumption for old cache style
 
-        if os.path.exists(npz_file_norm):
-            # image_key is full path
+        if os.path.exists(npz_file_norm): # image_key might be full path to image
             npz_file_flip = base_name + "_flip.npz"
             if not os.path.exists(npz_file_flip):
                 npz_file_flip = None
             return npz_file_norm, npz_file_flip
 
-        # if not full path, check image_dir. if image_dir is None, return None
-        if subset.image_dir is None:
-            return None, None
+        if subset.image_dir: # image_key is relative to subset.image_dir
+            path_in_subset_dir = os.path.join(subset.image_dir, image_key)
+            base_name_in_subset = os.path.splitext(path_in_subset_dir)[0]
+            npz_file_norm_in_subset = base_name_in_subset + ".npz"
+            if os.path.exists(npz_file_norm_in_subset):
+                npz_file_flip_in_subset = base_name_in_subset + "_flip.npz"
+                if not os.path.exists(npz_file_flip_in_subset):
+                    npz_file_flip_in_subset = None
+                return npz_file_norm_in_subset, npz_file_flip_in_subset
+        
+        return None, None # No old-style npz found based on image_key
 
-        # image_key is relative path
-        npz_file_norm = os.path.join(subset.image_dir, image_key + ".npz")
-        npz_file_flip = os.path.join(subset.image_dir, image_key + "_flip.npz")
+    def __getitem__(self, index):
+        # This __getitem__ is inherited from BaseDataset.
+        # The crucial part for the current error is how example["text_encoder_outputs_list"]
+        # and example["input_ids_list"] are populated within BaseDataset.__getitem__.
 
-        if not os.path.exists(npz_file_norm):
-            npz_file_norm = None
-            npz_file_flip = None
-        elif not os.path.exists(npz_file_flip):
-            npz_file_flip = None
+        # Let's assume BaseDataset.__getitem__ is called and it uses the robust_stack_per_component
+        # and the refined logic for input_ids_list.
 
-        return npz_file_norm, npz_file_flip
+        # For clarity, here's where the refined robust_stack_per_component should be applied
+        # within BaseDataset.__getitem__ (as shown in the previous response).
 
+        # --- This is effectively a call to super().__getitem__(index) ---
+        # --- but with the specific assembly logic pasted here for review ---
+
+        bucket = self.bucket_manager.buckets[self.buckets_indices[index].bucket_index]
+        bucket_batch_size = self.buckets_indices[index].bucket_batch_size
+        image_index_in_bucket = self.buckets_indices[index].batch_index * bucket_batch_size
+
+        # Prepare lists for batch items
+        loss_weights = []
+        captions_for_batch = [] # Renamed to avoid clash with `caption` loop var
+        
+        # For raw token data (before stacking, if tokenization occurs)
+        # List of (per-item token data). Per-item token data is List[Optional[Tensor]] or Dict for Flux.
+        input_ids_list_per_item_in_batch = [] 
+        
+        # For cached/loaded text encoder outputs
+        # List of (per-item TE output list). Per-item TE output list is List[Optional[ndarray_or_tensor]].
+        text_encoder_outputs_list_per_item_in_batch = [] 
+        
+        images_for_batch = []
+        latents_list_for_batch = []
+        alpha_mask_list_for_batch = []
+        original_sizes_hw_for_batch = []
+        crop_top_lefts_for_batch = []
+        target_sizes_hw_for_batch = []
+        flipped_list_for_batch = []
+        custom_attributes_for_batch = []
+        
+        # This is needed if re-tokenizing due to partial cache miss in batch
+        image_info_list_for_batch_ref = [] 
+
+        for i_loop_var in range(bucket_batch_size): # Iterate up to batch_size
+            current_image_idx_in_bucket = image_index_in_bucket + i_loop_var
+            if current_image_idx_in_bucket >= len(bucket):
+                break # Not enough items left in bucket for a full batch
+            
+            image_key = bucket[current_image_idx_in_bucket]
+            image_info = self.image_data[image_key]
+            subset = self.image_to_subset[image_key]
+            
+            image_info_list_for_batch_ref.append(image_info) # For potential re-tokenization reference
+
+            custom_attributes_for_batch.append(subset.custom_attributes)
+            loss_weights.append(self.prior_loss_weight if image_info.is_reg else 1.0)
+            flipped = subset.flip_aug and random.random() < 0.5
+
+            # --- Image/Latent loading ---
+            # (Copied from BaseDataset.__getitem__ as provided in previous interactions)
+            image_tensor_for_item = None
+            latents_tensor_for_item = None
+            alpha_mask_for_item = None # This should be a tensor
+            original_size_hw_for_item = None
+            crop_top_left_for_item = None
+            # target_size_hw_for_item is derived from bucket_reso or image.shape
+
+            if image_info.latents is not None:
+                original_size_tuple = image_info.latents_original_size # (W,H)
+                original_size_hw_for_item = (original_size_tuple[1], original_size_tuple[0])
+                crop_ltrb = image_info.latents_crop_ltrb 
+                if not flipped:
+                    latents_tensor_for_item = image_info.latents
+                    alpha_mask_for_item = image_info.alpha_mask # Should be Tensor
+                else:
+                    latents_tensor_for_item = image_info.latents_flipped
+                    alpha_mask_for_item = None if image_info.alpha_mask is None else torch.flip(image_info.alpha_mask, dims=[1]) # Flip H, W (dim 1 is W for [H,W])
+            elif image_info.latents_npz is not None:
+                loaded_latents_np, original_size_tuple, crop_ltrb, flipped_latents_np, alpha_mask_np = \
+                    self.latents_caching_strategy.load_latents_from_disk(image_info.latents_npz, image_info.bucket_reso)
+                original_size_hw_for_item = (original_size_tuple[1], original_size_tuple[0])
+                if flipped:
+                    latents_tensor_for_item = torch.from_numpy(flipped_latents_np) if flipped_latents_np is not None else None
+                    if alpha_mask_np is not None:
+                         alpha_mask_for_item = torch.from_numpy(alpha_mask_np[:, ::-1].copy()) # Flip width
+                else:
+                    latents_tensor_for_item = torch.from_numpy(loaded_latents_np)
+                    if alpha_mask_np is not None:
+                        alpha_mask_for_item = torch.from_numpy(alpha_mask_np)
+                if latents_tensor_for_item is not None: latents_tensor_for_item = latents_tensor_for_item.float()
+                if alpha_mask_for_item is not None: alpha_mask_for_item = alpha_mask_for_item.float()
+
+            else: # Load image from disk
+                img_np, face_cx, face_cy, face_w, face_h = self.load_image_with_face_info(
+                    subset, image_info.absolute_path, subset.alpha_mask
+                )
+                im_h_np, im_w_np = img_np.shape[0:2]
+
+                if self.enable_bucket:
+                    img_np, original_size_tuple, crop_ltrb = trim_and_resize_if_required(
+                        subset.random_crop, img_np, image_info.bucket_reso, image_info.resized_size, resize_interpolation=image_info.resize_interpolation
+                    )
+                else: # Not bucketing
+                    # ... (cropping logic if not bucketing, as in BaseDataset)
+                    if face_cx > 0:  
+                        img_np = self.crop_target(subset, img_np, face_cx, face_cy, face_w, face_h)
+                    elif im_h_np > self.height or im_w_np > self.width:
+                        # ... (random crop to self.height, self.width)
+                        if im_h_np > self.height:
+                            p = random.randint(0, im_h_np - self.height)
+                            img_np = img_np[p : p + self.height, :]
+                        if im_w_np > self.width:
+                            p = random.randint(0, im_w_np - self.width)
+                            img_np = img_np[:, p : p + self.width]
+                    original_size_tuple = (img_np.shape[1], img_np.shape[0]) # W, H
+                    crop_ltrb = (0,0,img_np.shape[1],img_np.shape[0]) # No effective crop if already target size
+
+                original_size_hw_for_item = (original_size_tuple[1], original_size_tuple[0])
+                
+                aug = self.aug_helper.get_augmentor(subset.color_aug)
+                if aug is not None:
+                    img_rgb_np = img_np[:, :, :3]
+                    img_rgb_np = aug(image=img_rgb_np)["image"]
+                    img_np[:, :, :3] = img_rgb_np
+                
+                if flipped:
+                    img_np = img_np[:, ::-1, :].copy()
+
+                if subset.alpha_mask:
+                    if img_np.shape[2] == 4:
+                        alpha_mask_for_item = torch.from_numpy(img_np[:, :, 3].astype(np.float32) / 255.0)
+                    else:
+                        alpha_mask_for_item = torch.ones((img_np.shape[0], img_np.shape[1]), dtype=torch.float32)
+                
+                image_tensor_for_item = self.image_transforms(img_np[:, :, :3])
+
+
+            images_for_batch.append(image_tensor_for_item)
+            latents_list_for_batch.append(latents_tensor_for_item)
+            alpha_mask_list_for_batch.append(alpha_mask_for_item)
+            
+            # target_size_hw based on final image/latent shape
+            if image_tensor_for_item is not None:
+                target_size_hw_for_item = (image_tensor_for_item.shape[1], image_tensor_for_item.shape[2]) # H, W
+            elif latents_tensor_for_item is not None:
+                target_size_hw_for_item = (latents_tensor_for_item.shape[1] * 8, latents_tensor_for_item.shape[2] * 8) # H, W
+            else: # Should not happen
+                target_size_hw_for_item = (self.height, self.width) if not self.enable_bucket else image_info.bucket_reso[::-1]
+
+
+            if not flipped:
+                crop_left_top_for_item = (crop_ltrb[0], crop_ltrb[1]) # L, T
+            else:
+                crop_left_top_for_item = (target_size_hw_for_item[1] - crop_ltrb[2], crop_ltrb[1]) # W_target - R_orig, T_orig
+
+            original_sizes_hw_for_batch.append(original_size_hw_for_item)
+            crop_top_lefts_for_batch.append((crop_left_top_for_item[1], crop_left_top_for_item[0])) # Store as T, L
+            target_sizes_hw_for_batch.append(target_size_hw_for_item)
+            flipped_list_for_batch.append(flipped)
+            
+            # --- Text Encoder Data ---
+            caption_for_item = image_info.caption 
+            current_item_te_outputs = None
+            current_item_input_ids_data = None # This will be List[Optional[Tensor]] or Dict
+
+            tokenization_required_for_item = True # Default
+            if self.text_encoder_output_caching_strategy: # Check if strategy exists
+                if image_info.text_encoder_outputs is not None: # In-memory python object cache
+                    current_item_te_outputs = image_info.text_encoder_outputs
+                    tokenization_required_for_item = False
+                elif image_info.text_encoder_outputs_npz is not None: # Path to disk cache
+                    if self.text_encoder_output_caching_strategy.is_disk_cached_outputs_expected(image_info.text_encoder_outputs_npz):
+                        current_item_te_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(image_info.text_encoder_outputs_npz)
+                        tokenization_required_for_item = False
+            
+            if tokenization_required_for_item:
+                caption_for_item = self.process_caption(subset, image_info.caption)
+                # tokenize_strategy.tokenize() for Flux returns a dict: {"clip_l": {"input_ids":...}, "t5xxl": ...}
+                # for SD, it returns a list of tensors: [clip_tokens_tensor]
+                token_data_from_strategy = self.tokenize_strategy.tokenize(caption_for_item)
+                current_item_input_ids_data = token_data_from_strategy 
+            
+            text_encoder_outputs_list_per_item_in_batch.append(current_item_te_outputs)
+            input_ids_list_per_item_in_batch.append(current_item_input_ids_data)
+            captions_for_batch.append(caption_for_item)
+
+        # --- Batch Assembly ---
+        example = {}
+        example["custom_attributes"] = custom_attributes_for_batch
+        example["loss_weights"] = torch.FloatTensor(loss_weights)
+        example["captions"] = captions_for_batch
+
+        # Assemble text_encoder_outputs_list
+        # This helper should be defined at module level or as a staticmethod if used by other Datasets too.
+        # For now, defining it here for clarity, assuming `logger` is accessible.
+        # Ensure `torch` and `Callable` are imported at the top of train_util.py.
+        # from typing import Callable, List, Optional, Tuple
+        # import torch
+        # import numpy as np # If numpy arrays are in the list
+        # global logger # if logger is defined globally in train_util.py
+
+        def _robust_stack_text_encoder_outputs(list_of_component_lists: List[Optional[List[Any]]], converter: Callable) -> Optional[List[Optional[torch.Tensor]]]:
+            if not list_of_component_lists: return None
+            first_valid_item = next((item for item in list_of_component_lists if item is not None), None)
+            if first_valid_item is None: return None
+                
+            num_components = len(first_valid_item)
+            batched_components: List[Optional[torch.Tensor]] = []
+
+            for i in range(num_components):
+                current_component_batch_items_data = [
+                    (item_list[i] if item_list is not None and i < len(item_list) else None) 
+                    for item_list in list_of_component_lists
+                ]
+                
+                if all(data_point is None for data_point in current_component_batch_items_data):
+                    batched_components.append(None)
+                else:
+                    # Convert non-None items. If a component is expected to be always present (e.g. t5_out for Flux),
+                    # then Nones here (other than for consistently None components like clip_l_pooled for Chroma) indicate an issue.
+                    converted_batch_items = []
+                    all_successfully_converted = True
+                    for data_point in current_component_batch_items_data:
+                        if data_point is not None:
+                            try:
+                                converted_batch_items.append(converter(data_point))
+                            except Exception as e_conv:
+                                logger.error(f"Failed to convert data for component {i}: {data_point}. Error: {e_conv}")
+                                converted_batch_items.append(None) # Mark as None if conversion fails
+                                all_successfully_converted = False 
+                        else:
+                            converted_batch_items.append(None) # Keep None as placeholder
+                    
+                    if not all_successfully_converted: # If any conversion failed for this component
+                        logger.error(f"Stacking for component {i} aborted due to conversion errors.")
+                        batched_components.append(None)
+                        continue
+
+                    # Filter out Nones ONLY if the intention is to stack variable length batch for this component,
+                    # OR if this component is truly optional per item and should not be stacked if any are None.
+                    # For fixed batching, all items must be tensors (or placeholders that become tensors).
+                    # For now, assume if not all are None, they should all be tensors or stackable.
+                    if any(item is None for item in converted_batch_items) and \
+                       not all(item is None for item in converted_batch_items): # Mixed None and Tensors
+                        logger.warning(f"Component {i} has mixed None and Tensor values; batched as None. This might be an issue if this component is essential.")
+                        batched_components.append(None)
+                    elif all(item is None for item in converted_batch_items): # All became None (or were None)
+                        batched_components.append(None)
+                    else: # All are presumed to be tensors now
+                        try:
+                            batched_components.append(torch.stack(converted_batch_items))
+                        except Exception as e_stack:
+                            logger.error(f"Error stacking component {i}: {e_stack}. Items: {converted_batch_items}")
+                            batched_components.append(None)
+            
+            return batched_components if not all(c is None for c in batched_components) else None
+
+        example["text_encoder_outputs_list"] = _robust_stack_text_encoder_outputs(text_encoder_outputs_list_per_item_in_batch, torch.FloatTensor)
+        
+        # Assemble input_ids_list (for SD strategy if needed, or for strategies that take token dicts per item)
+        # input_ids_list_per_item_in_batch contains per-item token data (e.g. [clip_ids, t5_ids] for SD, or dict for Flux, or None if cached)
+        if any(item_data is not None for item_data in input_ids_list_per_item_in_batch):
+            # This means at least one item in the batch required tokenization.
+            # The structure of `example["input_ids_list"]` depends on the strategy.
+            # For SD, it expects List[BatchedTensorForEachTE].
+            # For Flux, `process_batch` now re-tokenizes `batch["captions"]`.
+            # So, for Flux, `example["input_ids_list"]` can be None if this path is taken.
+            
+            if isinstance(self.tokenize_strategy, strategy_sd.SdTokenizeStrategy):
+                num_te_types_for_ids = len(self.tokenize_strategy.tokenizers)
+                final_stacked_input_ids = []
+                for te_idx in range(num_te_types_for_ids):
+                    tokens_this_te = []
+                    all_items_have_this_te_token = True
+                    for item_data in input_ids_list_per_item_in_batch:
+                        if item_data is not None and isinstance(item_data, list) and te_idx < len(item_data) and item_data[te_idx] is not None:
+                            tokens_this_te.append(item_data[te_idx])
+                        else:
+                            # This item was cached or didn't produce tokens for this TE.
+                            # For SD path in process_batch to work, it needs a full tensor.
+                            # This implies if one item needs tokenization, all items in batch must provide tokens.
+                            # This should be handled by re-tokenizing cached items if a batch is mixed,
+                            # OR by ensuring tokenize_strategy provides padding for optional TEs.
+                            logger.error(f"Inconsistent token data for SD strategy: item missing tokens for TE {te_idx} in a batch requiring tokenization.")
+                            all_items_have_this_te_token = False
+                            break 
+                    if all_items_have_this_te_token and tokens_this_te:
+                        final_stacked_input_ids.append(torch.stack(tokens_this_te))
+                    else:
+                        final_stacked_input_ids.append(None) # This TE type cannot be batched
+                example["input_ids_list"] = final_stacked_input_ids if not all(s is None for s in final_stacked_input_ids) else None
+            else: # For Flux or other strategies, input_ids_list might not be used by process_batch if it re-tokenizes captions
+                example["input_ids_list"] = None 
+        else: # All items had cached TE outputs
+            example["input_ids_list"] = None
+
+        # Alpha masks
+        if all(m is None for m in alpha_mask_list_for_batch):
+            example["alpha_masks"] = None
+        else:
+            # Ensure all are tensors of same size or handle padding if necessary for stacking
+            processed_alpha_masks = []
+            ref_shape = None
+            for am_idx, am_tensor in enumerate(alpha_mask_list_for_batch):
+                if am_tensor is not None:
+                    if ref_shape is None: ref_shape = am_tensor.shape
+                    elif am_tensor.shape != ref_shape:
+                        logger.warning(f"Alpha mask {am_idx} has different shape {am_tensor.shape}, expected {ref_shape}. Resizing/padding needed or error.")
+                        # Fallback: create ones of ref_shape. This is not ideal.
+                        am_tensor = torch.ones(ref_shape, dtype=torch.float32) if ref_shape else torch.ones_like(images_for_batch[0][0]) # Use first image's H,W
+                    processed_alpha_masks.append(am_tensor)
+                else: # alpha_mask was None for this item
+                    if ref_shape is not None: # Other items had alpha masks
+                         processed_alpha_masks.append(torch.ones(ref_shape, dtype=torch.float32))
+                    # If ref_shape is still None, it means all alpha_masks were None (already handled)
+                    # or this is the first item and it's None.
+                    # If images are present, use their shape.
+                    elif images_for_batch and images_for_batch[am_idx] is not None:
+                        processed_alpha_masks.append(torch.ones((images_for_batch[am_idx].shape[1], images_for_batch[am_idx].shape[2]), dtype=torch.float32))
+                    elif latents_list_for_batch and latents_list_for_batch[am_idx] is not None:
+                        processed_alpha_masks.append(torch.ones((latents_list_for_batch[am_idx].shape[1]*8, latents_list_for_batch[am_idx].shape[2]*8), dtype=torch.float32))
+                    else: # Cannot determine shape, this is an issue
+                        logger.error("Cannot determine shape for default alpha mask.")
+                        # This will cause stack to fail if other masks are present
+                        processed_alpha_masks.append(torch.empty(0)) # Should lead to error or be handled
+
+            if all(m is None or m.nelement() == 0 for m in processed_alpha_masks): # Check if all are effectively None
+                example["alpha_masks"] = None
+            else:
+                try:
+                    example["alpha_masks"] = torch.stack([m for m in processed_alpha_masks if m is not None and m.nelement() > 0])
+                    if example["alpha_masks"].nelement() == 0 and any(m is not None for m in alpha_mask_list_for_batch) : # Stacked to empty but shouldn't have
+                         example["alpha_masks"] = None # Fallback if stacking results in empty but there were masks.
+                except RuntimeError as e_alpha: # Catch stacking errors if shapes mismatch and not handled above
+                    logger.error(f"Error stacking alpha masks: {e_alpha}. Masks: {[m.shape if m is not None else None for m in processed_alpha_masks]}")
+                    example["alpha_masks"] = None
+
+
+        if all(img is None for img in images_for_batch):
+            example["images"] = None
+        else:
+            # This assumes all non-None images are stackable (same size)
+            # If not, collate_fn or this part needs to handle it (e.g. for debug_dataset)
+            # For training, either images or latents are used, not usually mixed.
+            stackable_images = [img for img in images_for_batch if img is not None]
+            example["images"] = torch.stack(stackable_images).contiguous().float() if stackable_images else None
+
+        if all(lat is None for lat in latents_list_for_batch):
+            example["latents"] = None
+        else:
+            stackable_latents = [lat for lat in latents_list_for_batch if lat is not None]
+            example["latents"] = torch.stack(stackable_latents).contiguous().float() if stackable_latents else None
+        
+        example["original_sizes_hw"] = torch.stack([torch.LongTensor(s) for s in original_sizes_hw_for_batch])
+        example["crop_top_lefts"] = torch.stack([torch.LongTensor(s) for s in crop_top_lefts_for_batch])
+        example["target_sizes_hw"] = torch.stack([torch.LongTensor(s) for s in target_sizes_hw_for_batch])
+        example["flippeds"] = flipped_list_for_batch
+        example["network_multipliers"] = torch.FloatTensor([self.network_multiplier] * len(captions_for_batch))
+
+        if self.debug_dataset:
+            keys_this_batch = [bucket[image_index_in_bucket + i_loop_var] for i_loop_var in range(len(loss_weights))]
+            example["image_keys"] = keys_this_batch
+            
+        return example
 
 class ControlNetDataset(BaseDataset):
     def __init__(

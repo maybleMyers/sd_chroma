@@ -361,8 +361,6 @@ class NetworkTrainer:
     def on_validation_step_end(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
         pass
 
-    # endregion
-
     def process_batch(
         self,
         batch,
@@ -375,15 +373,16 @@ class NetworkTrainer:
         weight_dtype,
         accelerator,
         args,
-        text_encoding_strategy: strategy_base.TextEncodingStrategy,
-        tokenize_strategy: strategy_base.TokenizeStrategy,
+        text_encoding_strategy: strategy_base.TextEncodingStrategy, # Use base type hint
+        tokenize_strategy: strategy_base.TokenizeStrategy, # Use base type hint
         is_train=True,
-        train_text_encoder=True,
+        train_text_encoder=True, 
         train_unet=True,
     ) -> torch.Tensor:
         """
         Process a batch for the network
         """
+        # ... (latent processing as before) ...
         with torch.no_grad():
             if "latents" in batch and batch["latents"] is not None:
                 latents = typing.cast(torch.FloatTensor, batch["latents"].to(accelerator.device))
@@ -402,64 +401,117 @@ class NetworkTrainer:
                             list_latents.append(chunk)
                     latents = torch.cat(list_latents, dim=0)
 
-                # NaNが含まれていれば警告を表示し0に置き換える
                 if torch.any(torch.isnan(latents)):
                     accelerator.print("NaN found in latents, replacing with zeros")
                     latents = typing.cast(torch.FloatTensor, torch.nan_to_num(latents, 0, out=latents))
-
             latents = self.shift_scale_latents(args, latents)
 
-        text_encoder_conds = []
-        text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
-        if text_encoder_outputs_list is not None:
-            text_encoder_conds = text_encoder_outputs_list  # List of text encoder outputs
+        text_encoder_conds = batch.get("text_encoder_outputs_list")
 
-        if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or train_text_encoder:
-            # TODO this does not work if 'some text_encoders are trained' and 'some are not and not cached'
+        needs_on_the_fly_encoding = False
+        if train_text_encoder:
+            needs_on_the_fly_encoding = True
+        else:
+            if text_encoder_conds is None: 
+                needs_on_the_fly_encoding = True
+        
+        if text_encoder_conds is None:
+            text_encoder_conds = [] 
+
+        if needs_on_the_fly_encoding:
+            input_ids_list_from_batch = batch.get("input_ids_list")
+            if input_ids_list_from_batch is None and ("captions" not in batch or batch["captions"] is None):
+                accelerator.print(
+                    "CRITICAL ERROR: Attempting on-the-fly text encoding, but "
+                    "neither batch['input_ids_list'] nor batch['captions'] are available."
+                )
+                raise ValueError(
+                    "Cannot perform on-the-fly text encoding: 'input_ids_list' and 'captions' are missing from the batch."
+                )
+
+            encoded_text_encoder_conds_new = None 
             with torch.set_grad_enabled(is_train and train_text_encoder), accelerator.autocast():
-                # Get the text embedding for conditioning
-                if args.weighted_captions:
-                    input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
-                    encoded_text_encoder_conds = text_encoding_strategy.encode_tokens_with_weights(
+                encode_kwargs = {}
+                # Check if the specific strategy might accept 'apply_t5_attn_mask'
+                # This is a way to pass it if the method signature supports it, without direct type checking
+                # Requires text_encoding_strategy.encode_tokens to handle unexpected kwargs gracefully or define them.
+                # The FluxTextEncodingStrategy already defines it.
+                if hasattr(args, "apply_t5_attn_mask"):
+                     encode_kwargs['apply_t5_attn_mask'] = args.apply_t5_attn_mask
+
+                if args.weighted_captions: 
+                    if "captions" not in batch or batch["captions"] is None:
+                         raise ValueError("Weighted captions require 'captions' in batch.")
+                    input_ids_list_tokenized, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                    encoded_text_encoder_conds_new = text_encoding_strategy.encode_tokens_with_weights(
                         tokenize_strategy,
-                        self.get_models_for_text_encoding(args, accelerator, text_encoders),
-                        input_ids_list,
+                        self.get_models_for_text_encoding(args, accelerator, text_encoders), 
+                        input_ids_list_tokenized, 
                         weights_list,
+                        **encode_kwargs # Pass kwargs here
                     )
-                else:
-                    input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
-                    encoded_text_encoder_conds = text_encoding_strategy.encode_tokens(
+                else: 
+                    input_ids_for_encoding_source = None
+                    if input_ids_list_from_batch is not None:
+                        input_ids_for_encoding_source = [ids.to(accelerator.device) for ids in input_ids_list_from_batch]
+                    elif "captions" in batch and batch["captions"] is not None:
+                        input_ids_for_encoding_source = tokenize_strategy.tokenize(batch["captions"])
+                    else:
+                        raise ValueError("Cannot encode: No 'input_ids_list' or 'captions' in batch.")
+
+                    encoded_text_encoder_conds_new = text_encoding_strategy.encode_tokens(
                         tokenize_strategy,
-                        self.get_models_for_text_encoding(args, accelerator, text_encoders),
-                        input_ids,
+                        self.get_models_for_text_encoding(args, accelerator, text_encoders), 
+                        input_ids_for_encoding_source, 
+                        **encode_kwargs # Pass kwargs here
                     )
-                if args.full_fp16:
-                    encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
 
-            # if text_encoder_conds is not cached, use encoded_text_encoder_conds
-            if len(text_encoder_conds) == 0:
-                text_encoder_conds = encoded_text_encoder_conds
+                if args.full_fp16: 
+                    encoded_text_encoder_conds_new = [
+                        c.to(weight_dtype) if c is not None else None for c in encoded_text_encoder_conds_new
+                    ]
+            
+            if not text_encoder_conds: 
+                text_encoder_conds = encoded_text_encoder_conds_new
             else:
-                # if encoded_text_encoder_conds is not None, update cached text_encoder_conds
-                for i in range(len(encoded_text_encoder_conds)):
-                    if encoded_text_encoder_conds[i] is not None:
-                        text_encoder_conds[i] = encoded_text_encoder_conds[i]
+                if len(text_encoder_conds) == len(encoded_text_encoder_conds_new):
+                    for i in range(len(encoded_text_encoder_conds_new)):
+                        if encoded_text_encoder_conds_new[i] is not None:
+                            text_encoder_conds[i] = encoded_text_encoder_conds_new[i]
+                else:
+                    accelerator.print(
+                        "Warning: Length mismatch between existing text_encoder_conds and newly encoded_text_encoder_conds. Replacing."
+                    )
+                    text_encoder_conds = encoded_text_encoder_conds_new
+        
+        if text_encoder_conds is None:
+             num_expected_te_outputs = len(text_encoders) if text_encoders else 1 
+             # A more robust way could be to ask the strategy, if possible, or have a fixed number for known architectures
+             # For Flux, it's 4 (l_pooled, t5_hidden, t5_ids, t5_mask)
+             # This is a fallback, ideally text_encoder_conds should always be a list by now.
+             if text_encoders and hasattr(text_encoders[0], '_is_flux_text_encoder_ensemble_for_instance'): # Pseudo-check
+                 num_expected_te_outputs = 4
+             elif self.is_sdxl : # Assuming self.is_sdxl is set by the trainer
+                 num_expected_te_outputs = 3 # text_hidden, sdxl_pooled, sdxl_text_hidden_2 (approx)
+             
+             logger.warning(f"text_encoder_conds is None before calling get_noise_pred_and_target. Defaulting to list of {num_expected_te_outputs} Nones.")
+             text_encoder_conds = [None] * num_expected_te_outputs
 
-        # sample noise, call unet, get target
+
         noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
             args,
             accelerator,
             noise_scheduler,
             latents,
             batch,
-            text_encoder_conds,
+            text_encoder_conds, 
             unet,
             network,
             weight_dtype,
             train_unet,
             is_train=is_train,
         )
-
+        
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
         loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
         if weighting is not None:
@@ -468,7 +520,7 @@ class NetworkTrainer:
             loss = apply_masked_loss(loss, batch)
         loss = loss.mean([1, 2, 3])
 
-        loss_weights = batch["loss_weights"]  # 各sampleごとのweight
+        loss_weights = batch["loss_weights"] 
         loss = loss * loss_weights
 
         loss = self.post_process_loss(loss, args, timesteps, noise_scheduler)
@@ -491,15 +543,12 @@ class NetworkTrainer:
             args.seed = random.randint(0, 2**32)
         set_seed(args.seed)
 
-        tokenize_strategy = self.get_tokenize_strategy(args)
-        strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
-        tokenizers = self.get_tokenizers(tokenize_strategy)  # will be removed after sample_image is refactored
-
-        # prepare caching strategy: this must be set before preparing dataset. because dataset may use this strategy for initialization.
-        latents_caching_strategy = self.get_latents_caching_strategy(args)
-        strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
-
-        # データセットを準備する
+        # ------------------------------------------------------------------
+        # STAGE 1: Early setup & Dataset Group Blueprint (NO STRATEGIES YET for dataset itself)
+        # ------------------------------------------------------------------
+        # データセットのブループリントだけ先に作る (戦略はまだ設定しない)
+        # これは train_dataset_group.assert_extra_args のために必要
+        # This is needed because self.assert_extra_args needs train_dataset_group
         if args.dataset_class is None:
             blueprint_generator = BlueprintGenerator(ConfigSanitizer(True, True, args.masked_loss, True))
             if use_user_config:
@@ -512,7 +561,8 @@ class NetworkTrainer:
                             ", ".join(ignored)
                         )
                     )
-            else:
+            else: # use_dreambooth_method or caption training
+                # ... (user_config creation logic as before) ...
                 if use_dreambooth_method:
                     logger.info("Using DreamBooth method.")
                     user_config = {
@@ -538,13 +588,56 @@ class NetworkTrainer:
                             }
                         ]
                     }
-
             blueprint = blueprint_generator.generate(user_config, args)
+            # Create a TEMPORARY dataset group just for assert_extra_args.
+            # It won't have the correct strategies yet, but that's fine for assert_extra_args.
+            temp_train_dataset_group, temp_val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
+        else:
+            temp_train_dataset_group = train_util.load_arbitrary_dataset(args) # type: ignore
+            temp_val_dataset_group = None
+
+        # ------------------------------------------------------------------
+        # STAGE 2: Call assert_extra_args (trainer-specific flags are set here)
+        # ------------------------------------------------------------------
+        self.assert_extra_args(args, temp_train_dataset_group, temp_val_dataset_group) # may change some args
+
+        # ------------------------------------------------------------------
+        # STAGE 3: Setup ALL strategies now that trainer-specific flags are available
+        # ------------------------------------------------------------------
+        tokenize_strategy = self.get_tokenize_strategy(args)
+        strategy_base.TokenizeStrategy.set_strategy(tokenize_strategy)
+        tokenizers = self.get_tokenizers(tokenize_strategy) # for sample_images
+
+        text_encoding_strategy = self.get_text_encoding_strategy(args)
+        strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
+
+        text_encoder_outputs_caching_strategy = self.get_text_encoder_outputs_caching_strategy(args)
+        if text_encoder_outputs_caching_strategy is not None:
+            strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_outputs_caching_strategy)
+
+        latents_caching_strategy = self.get_latents_caching_strategy(args)
+        strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
+
+        # ------------------------------------------------------------------
+        # STAGE 4: Re-create DatasetGroup with strategies now properly set globally
+        # The FineTuneDataset instances will pick them up via get_strategy()
+        # ------------------------------------------------------------------
+        if args.dataset_class is None:
+            # Re-generate with the now globally set strategies
+            # blueprint is already defined from STAGE 1
             train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
         else:
-            # use arbitrary dataset class
+            # For arbitrary dataset, it might need re-initialization or a way to update its strategies
+            # This path is less common for flux/sd3, assuming config_util is primary.
+            # If load_arbitrary_dataset also relies on get_strategy(), it should be fine.
             train_dataset_group = train_util.load_arbitrary_dataset(args)
-            val_dataset_group = None  # placeholder until validation dataset supported for arbitrary
+            val_dataset_group = None
+        
+        # Free temporary dataset groups if they were different objects
+        if 'temp_train_dataset_group' in locals() and temp_train_dataset_group is not train_dataset_group:
+            del temp_train_dataset_group
+        if 'temp_val_dataset_group' in locals() and temp_val_dataset_group is not val_dataset_group and temp_val_dataset_group is not None :
+            del temp_val_dataset_group
 
         current_epoch = Value("i", 0)
         current_step = Value("i", 0)
@@ -552,13 +645,13 @@ class NetworkTrainer:
         collator = train_util.collator_class(current_epoch, current_step, ds_for_collator)
 
         if args.debug_dataset:
-            train_dataset_group.set_current_strategies()  # dataset needs to know the strategies explicitly
+            train_dataset_group.set_current_strategies() # This call might be redundant if FineTuneDataset grabs them on init
             train_util.debug_dataset(train_dataset_group)
-
             if val_dataset_group is not None:
-                val_dataset_group.set_current_strategies()  # dataset needs to know the strategies explicitly
+                val_dataset_group.set_current_strategies()
                 train_util.debug_dataset(val_dataset_group)
             return
+
         if len(train_dataset_group) == 0:
             logger.error(
                 "No data found. Please verify arguments (train_data_dir must be the parent of folders with images) / 画像がありません。引数指定を確認してください（train_data_dirには画像があるフォルダではなく、画像があるフォルダの親フォルダを指定する必要があります）"
@@ -573,8 +666,8 @@ class NetworkTrainer:
                 assert (
                     val_dataset_group.is_latent_cacheable()
                 ), "when caching latents, either color_aug or random_crop cannot be used / latentをキャッシュするときはcolor_augとrandom_cropは使えません"
-
-        self.assert_extra_args(args, train_dataset_group, val_dataset_group)  # may change some args
+        
+        # self.assert_extra_args is already called.
 
         # acceleratorを準備する
         logger.info("preparing accelerator")
@@ -587,8 +680,6 @@ class NetworkTrainer:
 
         # モデルを読み込む
         model_version, text_encoder, vae, unet = self.load_target_model(args, weight_dtype, accelerator)
-
-        # text_encoder is List[CLIPTextModel] or CLIPTextModel
         text_encoders = text_encoder if isinstance(text_encoder, list) else [text_encoder]
 
         # 差分追加学習のためにモデルを読み込む
@@ -627,15 +718,17 @@ class NetworkTrainer:
             clean_memory_on_device(accelerator.device)
 
             accelerator.wait_for_everyone()
+        
+        # The following lines related to strategy setup are now correctly handled earlier
+        # and are effectively redundant here / can be removed.
+        # text_encoding_strategy = self.get_text_encoding_strategy(args) # Already done above
+        # strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy) # Already done above
 
-        # 必要ならテキストエンコーダーの出力をキャッシュする: Text Encoderはcpuまたはgpuへ移される
-        # cache text encoder outputs if needed: Text Encoder is moved to cpu or gpu
-        text_encoding_strategy = self.get_text_encoding_strategy(args)
-        strategy_base.TextEncodingStrategy.set_strategy(text_encoding_strategy)
+        # text_encoder_outputs_caching_strategy = self.get_text_encoder_outputs_caching_strategy(args) # Already done above
+        # if text_encoder_outputs_caching_strategy is not None:
+        #     strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_outputs_caching_strategy) # Already done above
 
-        text_encoder_outputs_caching_strategy = self.get_text_encoder_outputs_caching_strategy(args)
-        if text_encoder_outputs_caching_strategy is not None:
-            strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(text_encoder_outputs_caching_strategy)
+        # This call will now use the dataset group that was (hopefully) initialized with the correct text encoding strategy
         self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, train_dataset_group, weight_dtype)
         if val_dataset_group is not None:
             self.cache_text_encoder_outputs_if_needed(args, accelerator, unet, vae, text_encoders, val_dataset_group, weight_dtype)
@@ -827,17 +920,24 @@ class NetworkTrainer:
             unet.to(dtype=unet_weight_dtype)  # do not move to device because unet is not prepared by accelerator
 
         unet.requires_grad_(False)
-        unet.to(dtype=unet_weight_dtype)
+        unet.to(dtype=unet_weight_dtype) # unet_weight_dtype determined by fp8_base etc.
         for i, t_enc in enumerate(text_encoders):
-            t_enc.requires_grad_(False)
+            if t_enc is not None: # +++ ADD THIS CHECK +++
+                t_enc.requires_grad_(False)
 
-            # in case of cpu, dtype is already set to fp32 because cpu does not support fp8/fp16/bf16
-            if t_enc.device.type != "cpu":
-                t_enc.to(dtype=te_weight_dtype)
+                # in case of cpu, dtype is already set to fp32 because cpu does not support fp8/fp16/bf16
+                if t_enc.device.type != "cpu":
+                    # te_weight_dtype is also set considering fp8_base
+                    # If t_enc is already fp8 (e.g. loaded as fp8), keep it fp8. Otherwise, cast to te_weight_dtype.
+                    if hasattr(t_enc, 'dtype') and t_enc.dtype == torch.float8_e4m3fn:
+                        pass # Already fp8, do nothing regarding dtype casting here
+                    else:
+                        t_enc.to(dtype=te_weight_dtype) # Cast to fp16/bf16 if not fp8
 
-                # nn.Embedding not support FP8
-                if te_weight_dtype != weight_dtype:
-                    self.prepare_text_encoder_fp8(i, t_enc, te_weight_dtype, weight_dtype)
+                    # nn.Embedding not support FP8
+                    # If the target te_weight_dtype is fp8, but the general weight_dtype (for embeddings) is not.
+                    if te_weight_dtype == torch.float8_e4m3fn and te_weight_dtype != weight_dtype:
+                         self.prepare_text_encoder_fp8(i, t_enc, te_weight_dtype, weight_dtype)
 
         # acceleratorがなんかよろしくやってくれるらしい / accelerator will do something good
         if args.deepspeed:
@@ -880,11 +980,12 @@ class NetworkTrainer:
             # according to TI example in Diffusers, train is required
             unet.train()
             for i, (t_enc, frag) in enumerate(zip(text_encoders, self.get_text_encoders_train_flags(args, text_encoders))):
-                t_enc.train()
+                if t_enc is not None:  # +++ ADD THIS CHECK +++
+                    t_enc.train()
 
-                # set top parameter requires_grad = True for gradient checkpointing works
-                if frag:
-                    self.prepare_text_encoder_grad_ckpt_workaround(i, t_enc)
+                    # set top parameter requires_grad = True for gradient checkpointing works
+                    if frag: # frag indicates if this text encoder part should be trained
+                        self.prepare_text_encoder_grad_ckpt_workaround(i, t_enc)
 
         else:
             unet.eval()
@@ -1322,11 +1423,22 @@ class NetworkTrainer:
         # log device and dtype for each model
         logger.info(f"unet dtype: {unet_weight_dtype}, device: {unet.device}")
         for i, t_enc in enumerate(text_encoders):
-            params_itr = t_enc.parameters()
-            params_itr.__next__()  # skip the first parameter
-            params_itr.__next__()  # skip the second parameter. because CLIP first two parameters are embeddings
-            param_3rd = params_itr.__next__()
-            logger.info(f"text_encoder [{i}] dtype: {param_3rd.dtype}, device: {t_enc.device}")
+            if t_enc is not None:  # +++ ADD THIS CHECK +++
+                try: # Add try-except in case a TE doesn't have 3+ params (unlikely for these models but good practice)
+                    params_itr = t_enc.parameters()
+                    params_itr.__next__()  # skip the first parameter
+                    params_itr.__next__()  # skip the second parameter. because CLIP first two parameters are embeddings
+                    param_3rd = params_itr.__next__()
+                    logger.info(f"text_encoder [{i}] dtype: {param_3rd.dtype}, device: {t_enc.device}")
+                except StopIteration:
+                    # This means the text encoder has fewer than 3 parameters, which is unusual for these models.
+                    # Log the first parameter's dtype or just the general model dtype.
+                    first_param_dtype = next(t_enc.parameters()).dtype if any(t_enc.parameters()) else "N/A (no parameters)"
+                    logger.info(f"text_encoder [{i}] (fewer than 3 params) dtype: {first_param_dtype}, device: {t_enc.device}")
+                except Exception as e:
+                    logger.warning(f"Could not get detailed dtype for text_encoder [{i}]: {e}. Device: {t_enc.device}")
+            else: # +++ ADD THIS ELSE CASE FOR COMPLETENESS +++
+                logger.info(f"text_encoder [{i}] is None (not loaded).")
 
         clean_memory_on_device(accelerator.device)
 

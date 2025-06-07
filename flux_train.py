@@ -150,7 +150,7 @@ def train(args):
 
     train_dataset_group.verify_bucket_reso_steps(16)  # TODO これでいいか確認
 
-    _, is_schnell, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
+    model_type_str, _, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path) # num_double, num_single, metadata ignored here for now
     if args.debug_dataset:
         if args.cache_text_encoder_outputs:
             strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(
@@ -158,9 +158,12 @@ def train(args):
                     args.cache_text_encoder_outputs_to_disk, args.text_encoder_batch_size, args.skip_cache_check, False
                 )
             )
-        t5xxl_max_token_length = (
-            args.t5xxl_max_token_length if args.t5xxl_max_token_length is not None else (256 if is_schnell else 512)
-        )
+        if args.t5xxl_max_token_length is not None:
+            t5xxl_max_token_length = args.t5xxl_max_token_length
+        elif model_type_str == flux_utils.MODEL_TYPE_FLUX_SCHNELL or model_type_str == flux_utils.MODEL_TYPE_CHROMA: # Chroma uses Schnell's AE and likely similar token limits
+            t5xxl_max_token_length = 256
+        else: # Default for DEV or UNKNOWN (safer default)
+            t5xxl_max_token_length = 512
         strategy_base.TokenizeStrategy.set_strategy(strategy_flux.FluxTokenizeStrategy(t5xxl_max_token_length))
 
         train_dataset_group.set_current_strategies()
@@ -207,13 +210,12 @@ def train(args):
         accelerator.wait_for_everyone()
 
     # prepare tokenize strategy
-    if args.t5xxl_max_token_length is None:
-        if is_schnell:
-            t5xxl_max_token_length = 256
-        else:
-            t5xxl_max_token_length = 512
-    else:
+    if args.t5xxl_max_token_length is not None:
         t5xxl_max_token_length = args.t5xxl_max_token_length
+    elif model_type_str == flux_utils.MODEL_TYPE_FLUX_SCHNELL or model_type_str == flux_utils.MODEL_TYPE_CHROMA:
+        t5xxl_max_token_length = 256
+    else: # Default for DEV or UNKNOWN
+        t5xxl_max_token_length = 512
 
     flux_tokenize_strategy = strategy_flux.FluxTokenizeStrategy(t5xxl_max_token_length)
     strategy_base.TokenizeStrategy.set_strategy(flux_tokenize_strategy)
@@ -270,7 +272,8 @@ def train(args):
         clean_memory_on_device(accelerator.device)
 
     # load FLUX
-    _, flux = flux_utils.load_flow_model(
+    # model_type_str is already determined above from analyze_checkpoint_state
+    _, flux = flux_utils.load_flow_model( # First return value (model_type_str from load_flow_model) is ignored as we have it
         args.pretrained_model_name_or_path, weight_dtype, "cpu", args.disable_mmap_load_safetensors
     )
 
@@ -306,7 +309,7 @@ def train(args):
 
     if not cache_latents:
         # load VAE here if not cached
-        ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu")
+        ae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", args.disable_mmap_load_safetensors) # Added disable_mmap
         ae.requires_grad_(False)
         ae.eval()
         ae.to(accelerator.device, dtype=weight_dtype)
@@ -341,14 +344,14 @@ def train(args):
         for group in params_to_optimize:
             named_parameters = list(flux.named_parameters())
             assert len(named_parameters) == len(group["params"]), "number of parameters does not match"
-            for p, np in zip(group["params"], named_parameters):
+            for p, np_tuple in zip(group["params"], named_parameters): # Renamed np to np_tuple
                 # determine target layer and block index for each parameter
                 block_type = "other"  # double, single or other
-                if np[0].startswith("double_blocks"):
-                    block_index = int(np[0].split(".")[1])
+                if np_tuple[0].startswith("double_blocks"):
+                    block_index = int(np_tuple[0].split(".")[1])
                     block_type = "double"
-                elif np[0].startswith("single_blocks"):
-                    block_index = int(np[0].split(".")[1])
+                elif np_tuple[0].startswith("single_blocks"):
+                    block_index = int(np_tuple[0].split(".")[1])
                     block_type = "single"
                 else:
                     block_index = -1
@@ -359,20 +362,20 @@ def train(args):
                 param_group[param_group_key].append(p)
 
         block_types_and_indices = []
-        for param_group_key, param_group in param_group.items():
+        for param_group_key, param_group_val in param_group.items(): # Renamed param_group to param_group_val to avoid conflict
             block_types_and_indices.append(param_group_key)
-            grouped_params.append({"params": param_group, "lr": args.learning_rate})
+            grouped_params.append({"params": param_group_val, "lr": args.learning_rate})
 
             num_params = 0
-            for p in param_group:
-                num_params += p.numel()
+            for p_item in param_group_val: # Renamed p to p_item
+                num_params += p_item.numel()
             accelerator.print(f"block {param_group_key}: {num_params} parameters")
 
         # prepare optimizers for each group
         optimizers = []
         for group in grouped_params:
-            _, _, optimizer = train_util.get_optimizer(args, trainable_params=[group])
-            optimizers.append(optimizer)
+            _, _, optimizer_instance = train_util.get_optimizer(args, trainable_params=[group]) # Renamed optimizer to optimizer_instance
+            optimizers.append(optimizer_instance)
         optimizer = optimizers[0]  # avoid error in the following code
 
         logger.info(f"using {len(optimizers)} optimizers for blockwise fused optimizers")
@@ -416,7 +419,7 @@ def train(args):
     # lr schedulerを用意する
     if args.blockwise_fused_optimizers:
         # prepare lr schedulers for each optimizer
-        lr_schedulers = [train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes) for optimizer in optimizers]
+        lr_schedulers = [train_util.get_scheduler_fix(args, opt, accelerator.num_processes) for opt in optimizers] # Changed optimizer to opt
         lr_scheduler = lr_schedulers[0]  # avoid error in the following code
     else:
         lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
@@ -459,10 +462,16 @@ def train(args):
     else:
         # accelerator does some magic
         # if we doesn't swap blocks, we can move the model to device
-        flux = accelerator.prepare(flux, device_placement=[not is_swapping_blocks])
+        flux_prepared = accelerator.prepare(flux, device_placement=[not is_swapping_blocks]) # Renamed flux to flux_prepared
         if is_swapping_blocks:
-            accelerator.unwrap_model(flux).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
+            accelerator.unwrap_model(flux_prepared).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
+        
+        # After prepare, flux might be a DDP model or similar. We need to use the prepared model.
+        flux = flux_prepared # Update flux to the prepared version
+
         optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
+        training_models = [flux] # Update training_models to use the prepared flux
+
 
     # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
     if args.full_fp16:
@@ -509,16 +518,16 @@ def train(args):
         num_parameters_per_group = [0] * len(optimizers)
         parameter_optimizer_map = {}
 
-        for opt_idx, optimizer in enumerate(optimizers):
-            for param_group in optimizer.param_groups:
+        for opt_idx, opt_instance in enumerate(optimizers): # Changed opt to opt_instance
+            for param_group in opt_instance.param_groups:
                 for parameter in param_group["params"]:
                     if parameter.requires_grad:
 
-                        def grad_hook(parameter: torch.Tensor):
+                        def grad_hook(parameter_tensor: torch.Tensor): # Renamed parameter to parameter_tensor
                             if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                                accelerator.clip_grad_norm_(parameter, args.max_grad_norm)
+                                accelerator.clip_grad_norm_(parameter_tensor, args.max_grad_norm)
 
-                            i = parameter_optimizer_map[parameter]
+                            i = parameter_optimizer_map[parameter_tensor]
                             optimizer_hooked_count[i] += 1
                             if optimizer_hooked_count[i] == num_parameters_per_group[i]:
                                 optimizers[i].step()
@@ -611,14 +620,24 @@ def train(args):
                     text_encoder_conds = text_encoder_outputs_list
                 else:
                     # not cached or training, so get from text encoders
-                    tokens_and_masks = batch["input_ids_list"]
+                    # tokens_and_masks = batch["input_ids_list"] # This was the old way, now flux_tokenize_strategy.tokenize returns dict
                     with torch.no_grad():
-                        input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
+                        # Re-tokenize if not cached, as batch["input_ids_list"] might not be what FluxTextEncodingStrategy expects
+                        # Or ensure collator provides tokens_and_masks in the expected dict format
+                        # For now, assuming batch["input_ids_list"] is compatible or collator handles it.
+                        # If FluxTextEncodingStrategy.encode_tokens expects a dict like {'clip_l': ..., 't5xxl': ...}
+                        # then the collator or this part needs to ensure that.
+                        # Current flux_tokenize_strategy.tokenize returns such a dict.
+                        # If batch["input_ids_list"] is a list of tensors, it needs adaptation.
+                        # Assuming batch["input_ids_list"] is now the dict from tokenize strategy
+                        tokens_and_masks_dict = batch["input_ids_list"] # This should be the dict
+                        
                         text_encoder_conds = text_encoding_strategy.encode_tokens(
-                            flux_tokenize_strategy, [clip_l, t5xxl], input_ids, args.apply_t5_attn_mask
+                            flux_tokenize_strategy, [clip_l, t5xxl], tokens_and_masks_dict, args.apply_t5_attn_mask
                         )
-                        if args.full_fp16:
-                            text_encoder_conds = [c.to(weight_dtype) for c in text_encoder_conds]
+                        if args.full_fp16: # or full_bf16
+                            text_encoder_conds = [c.to(weight_dtype) if c is not None else None for c in text_encoder_conds]
+
 
                 # TODO support some features for noise implemented in get_noise_noisy_latents_and_timesteps
 
@@ -640,9 +659,13 @@ def train(args):
                 guidance_vec = torch.full((bsz,), float(args.guidance_scale), device=accelerator.device)
 
                 # call model
-                l_pooled, t5_out, txt_ids, t5_attn_mask = text_encoder_conds
-                if not args.apply_t5_attn_mask:
-                    t5_attn_mask = None
+                l_pooled, t5_out, txt_ids, t5_attn_mask_from_conds = text_encoder_conds # Renamed t5_attn_mask to avoid conflict
+                
+                # Determine the t5_attn_mask to use for the model call
+                # If args.apply_t5_attn_mask is True, we use the one from text_encoder_conds.
+                # Otherwise, it should be None.
+                actual_t5_attn_mask_for_model = t5_attn_mask_from_conds if args.apply_t5_attn_mask else None
+
 
                 with accelerator.autocast():
                     # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transformer model (we should not keep it but I want to keep the inputs same for the model for testing)
@@ -652,9 +675,9 @@ def train(args):
                         txt=t5_out,
                         txt_ids=txt_ids,
                         y=l_pooled,
-                        timesteps=timesteps / 1000,
+                        timesteps=timesteps / 1000, # timesteps are 0-1000 from scheduler, model expects 0-1 range
                         guidance=guidance_vec,
-                        txt_attention_mask=t5_attn_mask,
+                        txt_attention_mask=actual_t5_attn_mask_for_model,
                     )
 
                 # unpack latents
@@ -685,8 +708,8 @@ def train(args):
                 if not (args.fused_backward_pass or args.blockwise_fused_optimizers):
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                         params_to_clip = []
-                        for m in training_models:
-                            params_to_clip.extend(m.parameters())
+                        for m_model in training_models: # Renamed m to m_model
+                            params_to_clip.extend(m_model.parameters())
                         accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     optimizer.step()

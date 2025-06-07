@@ -161,11 +161,19 @@ class SdSdxlLatentsCachingStrategy(LatentsCachingStrategy):
 
     # TODO remove circular dependency for ImageInfo
     def cache_batch_latents(self, vae, image_infos: List, flip_aug: bool, alpha_mask: bool, random_crop: bool):
-        encode_by_vae = lambda img_tensor: vae.encode(img_tensor).latent_dist.sample()
+        # Check if vae is flux_models.AutoEncoder by checking its module.
+        # flux_models.AutoEncoder.encode() returns a Tensor directly.
+        # diffusers.AutoencoderKL.encode() returns an object with .latent_dist.sample().
+        if type(vae).__module__.startswith("library.flux_models"):
+            logger.debug("SdSdxlLatentsCachingStrategy detected a FLUX-like VAE; using direct encode.")
+            encode_by_vae_func = lambda img_tensor: vae.encode(img_tensor)
+        else:
+            logger.debug("SdSdxlLatentsCachingStrategy detected a Diffusers-like VAE; using .latent_dist.sample().")
+            encode_by_vae_func = lambda img_tensor: vae.encode(img_tensor).latent_dist.sample()
+
         vae_device = vae.device
         vae_dtype = vae.dtype
 
-        self._default_cache_batch_latents(encode_by_vae, vae_device, vae_dtype, image_infos, flip_aug, alpha_mask, random_crop)
-
+        self._default_cache_batch_latents(encode_by_vae_func, vae_device, vae_dtype, image_infos, flip_aug, alpha_mask, random_crop)
         if not train_util.HIGH_VRAM:
             train_util.clean_memory_on_device(vae.device)
