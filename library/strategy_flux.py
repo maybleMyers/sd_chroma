@@ -190,6 +190,12 @@ class FluxTextEncodingStrategy(TextEncodingStrategy):
 
         t5_input_ids = t5_token_info["input_ids"]
         if not is_batched_tokens: t5_input_ids = t5_input_ids.unsqueeze(0)
+        
+        # Defensive check and correction for t5_input_ids shape if it's batched
+        if is_batched_tokens and t5_input_ids.ndim == 3 and t5_input_ids.shape[1] == 1:
+            logger.warning(f"T5 input_ids has unexpected shape {t5_input_ids.shape}. Squeezing out singleton dimension.")
+            t5_input_ids = t5_input_ids.squeeze(1) # (B, 1, S) -> (B, S)
+        
         t5_input_ids = t5_input_ids.to(t5xxl_model.device)
 
         t5_attention_mask_for_model_input = None
