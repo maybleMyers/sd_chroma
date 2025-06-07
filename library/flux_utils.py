@@ -380,11 +380,9 @@ def get_t5xxl_actual_dtype(t5xxl: T5EncoderModel) -> torch.dtype:
     return t5xxl.encoder.block[0].layer[0].SelfAttention.q.weight.dtype
 
 
-def prepare_img_ids(batch_size: int, packed_latent_height: int, packed_latent_width: int):
-    img_ids = torch.zeros(packed_latent_height, packed_latent_width, 3)
-    img_ids[..., 1] = img_ids[..., 1] + torch.arange(packed_latent_height)[:, None]
-    img_ids[..., 2] = img_ids[..., 2] + torch.arange(packed_latent_width)[None, :]
-    img_ids = einops.repeat(img_ids, "h w c -> b (h w) c", b=batch_size)
+def prepare_img_ids(batch_size: int, packed_latent_height: int, packed_latent_width: int, device: Union[str, torch.device] = "cpu", dtype: torch.dtype = torch.long):    
+    num_img_tokens = packed_latent_height * packed_latent_width
+    img_ids = torch.arange(num_img_tokens, device=device, dtype=dtype).unsqueeze(0).repeat(batch_size, 1)
     return img_ids
 
 
