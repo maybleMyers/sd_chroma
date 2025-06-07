@@ -40,6 +40,199 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.is_swapping_blocks: bool = False
         self.train_clip_l: bool = False  # Initialize here
         self.train_t5xxl: bool = False # Initialize here
+
+    def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:
+        # FLUX.1 and SD3 typically don't use a "noise scheduler" in the same way Diffusers' DDPMScheduler is used for SD1.5/2.x.
+        # Timesteps are often handled as continuous values (0-1 or 0-1000) and sigmas are derived.
+        # The logic for noising and timesteps is in flux_train_utils.get_noisy_model_input_and_timesteps.
+        # For compatibility with the trainer structure, we might return a placeholder or a simplified object
+        # if the trainer's main loop absolutely needs a scheduler object for some functions (e.g., min_snr_gamma).
+        # However, flux_train_utils.get_noisy_model_input_and_timesteps uses args directly.
+        # For now, let's acknowledge that flux_train_utils handles it.
+        # If parts of the main train loop (like SNR gamma) *require* a scheduler object with specific attributes (like sigmas),
+        # we might need to create a dummy scheduler or adapt those parts.
+        # For min_snr_gamma, it needs noise_scheduler.alphas_cumprod.
+        # The DiT/Flux models use a direct sigma formulation, so SNR gamma might not be directly applicable
+        # or would need re-derivation based on sigmas.
+        
+        # Let's see if a DDPMScheduler can be configured to be mostly passive or if specific values are needed by flux_train_utils.
+        # flux_train_utils.get_noisy_model_input_and_timesteps uses noise_scheduler.config.num_train_timesteps
+        # and noise_scheduler.timesteps / noise_scheduler.sigmas for SD3 style weighting.
+
+        if args.timestep_sampling in ["logit_normal", "mode", "cosmap"]: # SD3-like sampling needs a scheduler for sigmas
+            logger.info(f"Using DDPMScheduler for SD3-style timestep sampling: {args.timestep_sampling}")
+            # This scheduler's beta schedule might not be directly used for FLUX style flow matching,
+            # but its timesteps and sigmas attributes are used by get_sigmas in flux_train_utils.
+            noise_scheduler = DDPMScheduler(
+                beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", 
+                num_train_timesteps=1000, clip_sample=False,
+                # SD3 specific scheduler settings if any, e.g. "interpolation_type" for RectifiedFlowScheduler
+                # For now, DDPMScheduler is used to provide .sigmas and .timesteps
+            )
+            # train_util.prepare_scheduler_for_custom_training(noise_scheduler, device) # Not strictly needed if only sigmas/timesteps are used
+            if args.zero_terminal_snr: # This modifies betas, might affect sigmas for SD3
+                custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
+            return noise_scheduler
+        else: # FLUX specific or other simple samplings
+            # For FLUX's own "shift" or "flux_shift", a full scheduler object isn't strictly necessary
+            # as timesteps are derived from args.sigmoid_scale etc.
+            # However, `post_process_loss` in the base trainer might still expect a scheduler.
+            # Let's return a simple object or None if those parts are also overridden.
+            # Given post_process_loss needs overriding anyway, this can be simplified.
+            logger.info(f"FLUX timestep sampling ({args.timestep_sampling}) does not strictly require a Diffusers scheduler object here. Returning a basic DDPMScheduler for compatibility.")
+            # Provide a basic scheduler for num_train_timesteps if used by get_noisy_model_input_and_timesteps
+            return DDPMScheduler(num_train_timesteps=1000) # Or derive from args if there's a flux_num_steps
+
+    def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoders, unet):
+        # tokenizers will be [clip_l_tokenizer_or_None, t5_tokenizer]
+        # text_encoders will be [clip_l_model_or_None, t5_model]
+        # unet is the FLUX model
+        # vae is the FLUX AE
+        logger.info("FluxNetworkTrainer: Calling flux_train_utils.sample_images")
+        flux_train_utils.sample_images(
+            accelerator,
+            args,
+            epoch,
+            global_step,
+            unet, # FLUX model
+            vae,  # FLUX AE
+            text_encoders, # List of [CLIP-L or None, T5XXL]
+            self.sample_prompts_te_outputs, # Cached outputs for sample prompts
+            # prompt_replacement and controlnet are not used in this specific LoRA trainer context for now
+        )
+
+    def encode_images_to_latents(self, args, vae: flux_models.AutoEncoder, images: torch.FloatTensor) -> torch.FloatTensor:
+        # FLUX AutoEncoder's encode method directly returns the latents (already sampled if it's a VAE part)
+        # and applies internal scaling/shifting.
+        logger.debug("FluxNetworkTrainer: using FLUX AE direct encode.")
+        return vae.encode(images)
+
+    def shift_scale_latents(self, args, latents: torch.FloatTensor) -> torch.FloatTensor:
+        # The output of flux_models.AutoEncoder.encode() is already scaled and shifted
+        # according to its internal scale_factor and shift_factor.
+        # So, no further scaling by the old SD vae_scale_factor (0.18215) is needed.
+        logger.debug("FluxNetworkTrainer: shift_scale_latents is a no-op as FLUX AE handles scaling internally.")
+        return latents # Return latents as is
+
+    def post_process_loss(self, loss: torch.FloatTensor, args: argparse.Namespace, timesteps: torch.Tensor, noise_scheduler) -> torch.FloatTensor:
+        # FLUX models might not use the same SNR weighting or v-prediction-like loss adjustments as SD1.5/2.x.
+        # The primary loss is typically MSE between (model_pred + latents) and noise, or similar,
+        # after model_pred is adjusted by apply_model_prediction_type.
+        # If args.min_snr_gamma or other SD-specific loss args are used, they might be misapplied here.
+        # For now, let's assume these are not used or handled correctly by their conditions.
+        # If specific FLUX/SD3 loss weighting is needed, it would go here.
+        
+        # The `weighting` from `apply_model_prediction_type` (for sigma_scaled) is already applied
+        # to the loss *before* this function in the base NetworkTrainer.process_batch if that weighting is returned.
+        # This function in the base trainer then applies min_snr_gamma etc.
+        
+        # For FLUX, if args.model_prediction_type is "sigma_scaled", a weighting is already computed.
+        # Other SD-specific weightings like min_snr_gamma are likely not applicable or need re-derivation for flow matching.
+
+        if args.min_snr_gamma:
+            logger.warning("min_snr_gamma is specified but may not be directly applicable to FLUX models without careful scheduler setup.")
+            # If a compatible scheduler was set up in get_noise_scheduler, this might work, but needs verification.
+            # For now, let parent handle it, but be aware.
+            return super().post_process_loss(loss, args, timesteps, noise_scheduler)
+        
+        # Other SD-specific losses:
+        if args.scale_v_pred_loss_like_noise_pred or args.v_pred_like_loss or args.debiased_estimation_loss:
+            logger.warning("SD-specific loss processing (scale_v_pred, v_pred_like, debiased_estimation) may not apply to FLUX.")
+            return super().post_process_loss(loss, args, timesteps, noise_scheduler) # Let parent handle if flags are on
+
+        logger.debug("FluxNetworkTrainer: post_process_loss returning loss as is (or after parent's if flags were set).")
+        return loss # Or return super().post_process_loss(loss, args, timesteps, noise_scheduler) if we want to keep parent's logic
+
+    def get_sai_model_spec(self, args: argparse.Namespace) -> dict:
+        # FLUX model has its own SAI model spec
+        # Use flux_utils.MODEL_TYPE_FLUX_DEV, flux_utils.MODEL_TYPE_FLUX_SCHNELL, or flux_utils.MODEL_TYPE_CHROMA
+        # self.model_type_str should be set
+        if self.model_type_str is None: # Fallback if not set, though it should be
+             logger.warning("model_type_str not set in get_sai_model_spec, attempting to analyze checkpoint again.")
+             if args.pretrained_model_name_or_path:
+                self.model_type_str, _, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
+             else: # Cannot determine type
+                 logger.error("Cannot determine FLUX model type for SAI metadata as pretrained_model_name_or_path is missing.")
+                 return train_util.get_sai_model_spec(None, args, is_sdxl=False, is_stable_diffusion_ckpt=True, flux="unknown_flux_type")
+
+
+        # Map internal model_type_str to the SAI flux argument string if necessary,
+        # or directly use a general one like flux_utils.MODEL_TYPE_FLUX_DEV for all trained LoRAs for now.
+        # For simplicity, let's use MODEL_TYPE_FLUX_DEV as a general tag for LoRAs trained on any FLUX variant.
+        # More specific tagging could be done if needed.
+        logger.info(f"FluxNetworkTrainer: Using flux='{flux_utils.MODEL_TYPE_FLUX_DEV}' for SAI metadata (original base: {self.model_type_str}).")
+        return train_util.get_sai_model_spec(
+            None, args, is_sdxl=False, is_stable_diffusion_ckpt=True, flux=flux_utils.MODEL_TYPE_FLUX_DEV # Generic tag
+        )
+
+    def is_text_encoder_not_needed_for_training(self, args):
+        # For FLUX, text encoders are always used by the DiT for conditioning,
+        # and also for sampling. So, they are "needed" in a general sense.
+        # This flag in the base trainer is more about whether they can be *deleted*
+        # after caching IF they are also not trained.
+        # If text encoders are not trained AND their outputs are cached, they might be deletable from VRAM.
+        # However, they are still needed for the sample_images step.
+        
+        # If TEs are not trained AND caching is on, they are moved to CPU after caching anyway.
+        # If TEs are not trained AND caching is OFF, they are kept on GPU for on-the-fly encoding.
+        # If TEs ARE trained, they are on GPU.
+        
+        # The main loop's sample_images call needs them.
+        # So, they are never truly "not needed" to the point of deletion from the trainer object.
+        return False
+    
+    def update_metadata(self, metadata: dict, args: argparse.Namespace):
+        """
+        Update metadata with FLUX-specific training arguments.
+        """
+        super().update_metadata(metadata, args) # Call parent if it ever does something
+
+        metadata["ss_flux_model_type"] = self.model_type_str # Determined during model loading
+        
+        # Determine t5xxl_max_token_length as it might not be directly in args if defaulted
+        # (already done in get_tokenize_strategy, can reuse logic or store it)
+        # For simplicity, let's re-evaluate or assume args.t5xxl_max_token_length is populated
+        # if it was user-provided, or take the default used.
+        
+        # Re-determine t5xxl_max_token_length if not directly in args (safer)
+        if args.t5xxl_max_token_length is None:
+            if self.model_type_str == flux_utils.MODEL_TYPE_FLUX_SCHNELL or \
+               self.model_type_str == flux_utils.MODEL_TYPE_CHROMA:
+                effective_t5_max_length = 256
+            else: # Dev or Unknown
+                effective_t5_max_length = 512
+        else:
+            effective_t5_max_length = args.t5xxl_max_token_length
+        
+        metadata["ss_t5xxl_max_token_length"] = effective_t5_max_length
+        metadata["ss_apply_t5_attn_mask"] = args.apply_t5_attn_mask
+        metadata["ss_guidance_scale_flux"] = args.guidance_scale # Note: different from SD's CFG scale
+        
+        # Timestep sampling specific to FLUX/SD3 style
+        metadata["ss_timestep_sampling"] = args.timestep_sampling
+        if args.timestep_sampling in ["sigmoid", "shift", "flux_shift"]:
+            metadata["ss_sigmoid_scale"] = args.sigmoid_scale
+        if args.timestep_sampling == "shift":
+            metadata["ss_discrete_flow_shift"] = args.discrete_flow_shift
+        if args.timestep_sampling in ["logit_normal", "mode"]: # SD3 specific, but part of the same arg group
+            if args.logit_mean is not None: metadata["ss_logit_mean"] = args.logit_mean
+            if args.logit_std is not None: metadata["ss_logit_std"] = args.logit_std
+            if args.mode_scale is not None: metadata["ss_mode_scale"] = args.mode_scale
+        
+        metadata["ss_model_prediction_type_flux"] = args.model_prediction_type # Note: different from SD's v_param
+
+        # Add paths to text encoders and AE if they were provided
+        if args.clip_l:
+            metadata["ss_clip_l_path"] = os.path.basename(args.clip_l) if os.path.exists(args.clip_l) else args.clip_l
+        if args.t5xxl:
+            metadata["ss_t5xxl_path"] = os.path.basename(args.t5xxl) if os.path.exists(args.t5xxl) else args.t5xxl
+        if args.ae:
+            metadata["ss_ae_path_flux"] = os.path.basename(args.ae) if os.path.exists(args.ae) else args.ae
+        
+        if args.controlnet_model_name_or_path:
+            metadata["ss_controlnet_model_flux"] = os.path.basename(args.controlnet_model_name_or_path) \
+                if os.path.exists(args.controlnet_model_name_or_path) else args.controlnet_model_name_or_path
+            
     def prepare_unet_with_accelerator(
         self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module # unet is the FLUX model here
     ) -> torch.nn.Module:
