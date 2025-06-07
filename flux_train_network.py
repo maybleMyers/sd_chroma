@@ -248,14 +248,14 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 except Exception as e:
                     logger.error(f"Could not analyze checkpoint state for caching strategy: {e}. Assuming no CLIP-L.")
                     self.model_type_str = flux_utils.MODEL_TYPE_CHROMA  # Fallback to Chroma for safety
-    
+
             has_clip_l = False
             if self.model_type_str in [flux_utils.MODEL_TYPE_FLUX_DEV, flux_utils.MODEL_TYPE_FLUX_SCHNELL]:
                 has_clip_l = True
             elif args.clip_l is not None:
                 has_clip_l = True
                 logger.warning("CLIP-L path provided, but model type is Chroma or undetermined. CLIP-L will be ignored for Chroma.")
-    
+
             return strategy_flux.FluxTextEncoderOutputsCachingStrategy(
                 args.cache_text_encoder_outputs_to_disk,
                 args.text_encoder_batch_size,
@@ -658,6 +658,10 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             if txt_ids is not None and txt_ids.dtype.is_floating_point: # Unlikely but safe check
                  txt_ids.requires_grad_(True) 
             logger.info(f"DEBUG: TE conds device after move - l_pooled: {l_pooled.device if l_pooled is not None else 'None'}, t5_out: {t5_out.device if t5_out is not None else 'None'}")
+            # +++ ADD SHAPE LOGGING +++
+            logger.info(f"DEBUG: txt_ids (shape, ndim, dtype): {txt_ids.shape if txt_ids is not None else 'None'}, {txt_ids.ndim if txt_ids is not None else 'None'}, {txt_ids.dtype if txt_ids is not None else 'None'}")
+            logger.info(f"DEBUG: img_ids (shape, ndim, dtype): {img_ids.shape if img_ids is not None else 'None'}, {img_ids.ndim if img_ids is not None else 'None'}, {img_ids.dtype if img_ids is not None else 'None'}")
+            logger.info(f"DEBUG: t5_out (txt) (shape, ndim, dtype): {t5_out.shape if t5_out is not None else 'None'}, {t5_out.ndim if t5_out is not None else 'None'}, {t5_out.dtype if t5_out is not None else 'None'}")            
             img_ids.requires_grad_(True)
             guidance_vec.requires_grad_(True)
         
