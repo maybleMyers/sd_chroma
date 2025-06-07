@@ -7,6 +7,7 @@ import random
 from typing import Any, Optional, Union
 
 import torch
+torch.autograd.set_detect_anomaly(True)
 from accelerate import Accelerator
 from diffusers import DDPMScheduler # <--- ADD THIS IMPORT
 
@@ -74,7 +75,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             logger.info(f"Manually reduced network gradients across DDP processes (num_processes: {accelerator.state.num_processes}).")
         else:
             logger.debug("all_reduce_network: Single process, no DDP reduction needed for the network.")
-            
+
     def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True):
         """
         Called at the start of each training step. Implements basic logging and ensures compatibility
