@@ -38,33 +38,44 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.sample_prompts_te_outputs = None
         self.model_type_str: Optional[str] = None # Store analyzed model type
         self.is_swapping_blocks: bool = False
+        self.train_clip_l: bool = False  # Initialize here
+        self.train_t5xxl: bool = False # Initialize here
+
     def get_text_encoder_outputs_caching_strategy(self, args):
         if args.cache_text_encoder_outputs:
-            # Determine if CLIP-L is part of the model being trained/cached
-            # model_type_str should be set by load_target_model before this usually.
-            if self.model_type_str is None:
-                # Fallback if somehow not set, though it should be
-                self.model_type_str, _, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
+            if self.model_type_str is None and args.pretrained_model_name_or_path: # Ensure model_type_str is available
+                try:
+                    self.model_type_str, _, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
+                except Exception as e:
+                    logger.error(f"Could not analyze checkpoint state for caching strategy: {e}. Defaulting has_clip_l.")
+            
+            has_clip_l = False # Default for Chroma or if undetermined
+            if self.model_type_str in [flux_utils.MODEL_TYPE_FLUX_DEV, flux_utils.MODEL_TYPE_FLUX_SCHNELL]:
+                has_clip_l = True
+            elif args.clip_l is not None and self.model_type_str != flux_utils.MODEL_TYPE_CHROMA: # Fallback if model_type_str is None but clip_l provided
+                has_clip_l = True
 
-            has_clip_l = (self.model_type_str != flux_utils.MODEL_TYPE_CHROMA) # Chroma doesn't use CLIP-L
 
             return strategy_flux.FluxTextEncoderOutputsCachingStrategy(
                 args.cache_text_encoder_outputs_to_disk,
-                args.text_encoder_batch_size, # or args.train_batch_size if None
+                args.text_encoder_batch_size, 
                 args.skip_cache_check,
-                has_clip_l=has_clip_l, # Pass whether CLIP-L is expected
-                is_train_clip_l=self.train_clip_l,
-                is_train_t5=self.train_t5xxl, # Assuming self.train_t5xxl is set
-                apply_t5_attn_mask=args.apply_t5_attn_mask, # pass this from args
+                has_clip_l=has_clip_l, 
+                is_train_clip_l=self.train_clip_l, # Relies on self.train_clip_l being set by assert_extra_args
+                is_train_t5=self.train_t5xxl,     # Relies on self.train_t5xxl being set by assert_extra_args
+                apply_t5_attn_mask=args.apply_t5_attn_mask, 
             )
         return None
+
     def assert_extra_args(
         self,
         args,
         train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
         val_dataset_group: Optional[train_util.DatasetGroup],
     ):
-        super().assert_extra_args(args, train_dataset_group, val_dataset_group)
+        # REMOVED: super().assert_extra_args(args, train_dataset_group, val_dataset_group)
+        # The parent's assert_extra_args calls verify_bucket_reso_steps(64), 
+        # which is for SD/SDXL. Flux needs 32, which is handled below.
 
         if args.fp8_base_unet:
             args.fp8_base = True 
@@ -80,11 +91,56 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 train_dataset_group.is_text_encoder_output_cacheable()
             ), "when caching Text Encoder output, either caption_dropout_rate, shuffle_caption, token_warmup_step or caption_tag_dropout_rate cannot be used"
 
-        self.train_clip_l = not args.network_train_unet_only if args.clip_l is not None else False # Only train if provided
-        self.train_t5xxl = False 
+        # Analyze model_type_str if not already done (e.g. by load_target_model, but that's later)
+        # This is needed for train_clip_l and train_t5xxl determination.
+        if self.model_type_str is None and args.pretrained_model_name_or_path:
+            try:
+                self.model_type_str, _, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
+            except Exception as e:
+                logger.error(
+                    f"Could not analyze checkpoint state in assert_extra_args: {e}. "
+                    f"Flags for training CLIP-L/T5XXL might be based on defaults."
+                )
+        
+        # Determine which text encoders are to be trained
+        _train_clip_l = False
+        _train_t5 = False
 
-        if args.max_token_length is not None:
-            logger.warning("max_token_length is not used in Flux training")
+        if not args.network_train_unet_only:  # If TEs *can* be trained
+            if self.model_type_str == flux_utils.MODEL_TYPE_CHROMA:
+                _train_t5 = True 
+                _train_clip_l = False 
+                if args.clip_l is not None:
+                     logger.warning("Chroma model type specified. --clip_l is provided but will be ignored for training.")
+            elif self.model_type_str in [flux_utils.MODEL_TYPE_FLUX_DEV, flux_utils.MODEL_TYPE_FLUX_SCHNELL]:
+                if args.clip_l is not None:
+                    _train_clip_l = True
+                else:
+                    # This case should ideally raise an error if --clip_l is truly required for these models for TE training
+                    logger.error(
+                        f"Model type {self.model_type_str} is configured for Text Encoder training, "
+                        f"but --clip_l argument (path to CLIP-L model) was not provided. CLIP-L cannot be trained."
+                    )
+                    # Depending on strictness, you might want to raise ValueError here
+                    # raise ValueError(f"Model type {self.model_type_str} requires --clip_l for Text Encoder training.")
+                    _train_clip_l = False 
+                _train_t5 = True 
+            else: 
+                logger.warning(
+                    f"Unknown or undetermined model type ('{self.model_type_str}'). "
+                    f"Falling back to generic TE training flags based on --clip_l and --network_train_unet_only."
+                )
+                if args.clip_l is not None: # Only consider training CLIP-L if its path is given
+                    _train_clip_l = True
+                _train_t5 = True 
+        
+        self.train_clip_l = _train_clip_l
+        self.train_t5xxl = _train_t5
+        logger.info(f"DEBUG: In assert_extra_args: self.train_clip_l set to {self.train_clip_l}, self.train_t5xxl set to {self.train_t5xxl}")
+
+
+        if args.max_token_length is not None: # This refers to SD-style max_token_length
+            logger.warning("max_token_length (SD style) is not used in Flux training. Use --t5xxl_max_token_length for T5.")
 
         assert (
             args.blocks_to_swap is None or args.blocks_to_swap == 0
