@@ -269,7 +269,26 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         # text_encoders[0] is clip_l, text_encoders[1] is t5xxl
         train_clip_l_flag = self.train_clip_l and (text_encoders[0] is not None)
         return [train_clip_l_flag, self.train_t5xxl]
+    
+    def get_latents_caching_strategy(self, args):
+        # Flux models (like FLUX.1 Dev/Schnell/Chroma) use a VAE that outputs latents
+        # with a different downscale factor than SD1.5/2.x/XL.
+        # For Flux, the typical downscale factor for the AE is 16 (e.g., 1024 -> 64 latents).
+        # However, the `FluxLatentsCachingStrategy` itself calculates the suffix based on image_size
+        # and its `is_disk_cached_latents_expected` uses a downscale_factor of 8, which seems incorrect for Flux AE.
+        # The `cache_batch_latents` in FluxLatentsCachingStrategy uses vae.encode directly.
+        # The strategy_base._default_is_disk_cached_latents_expected takes `latents_stride`
+        # which is the VAE downscale factor. For Flux AE this is 16.
 
+        # For now, we will instantiate FluxLatentsCachingStrategy.
+        # We might need to review FluxLatentsCachingStrategy if the downscale factor of 8 it uses internally is problematic.
+        logger.info("Using FluxLatentsCachingStrategy for Flux models.")
+        return strategy_flux.FluxLatentsCachingStrategy(
+            args.cache_latents_to_disk,
+            args.vae_batch_size, # or args.train_batch_size if None, but vae_batch_size is more specific
+            args.skip_cache_check,
+        )
+    
     def cache_text_encoder_outputs_if_needed(
         self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: train_util.DatasetGroup, weight_dtype
     ):

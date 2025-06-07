@@ -42,6 +42,7 @@ class TextEncodingStrategy:
         return cls._strategy
 class FluxLatentsCachingStrategy(LatentsCachingStrategy):
     FLUX_LATENTS_NPZ_SUFFIX = "_flux.npz"
+    FLUX_VAE_DOWNSCALE_FACTOR = 16 # Correct downscale factor for FLUX AE
 
     def __init__(self, cache_to_disk: bool, batch_size: int, skip_disk_cache_validity_check: bool) -> None:
         super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check)
@@ -59,36 +60,33 @@ class FluxLatentsCachingStrategy(LatentsCachingStrategy):
 
     def is_disk_cached_latents_expected(self, bucket_reso: Tuple[int, int], npz_path: str, flip_aug: bool, alpha_mask: bool):
         return self._default_is_disk_cached_latents_expected(
-            downscale_factor=8,
+            latents_stride=self.FLUX_VAE_DOWNSCALE_FACTOR, # Use correct downscale factor
             bucket_reso=bucket_reso,
             npz_path=npz_path,
             flip_aug=flip_aug,
             alpha_mask=alpha_mask,
-            multi_resolution=True
+            multi_resolution=True # Flux uses multi-resolution style naming
         )
 
     def load_latents_from_disk(
         self, npz_path: str, bucket_reso: Tuple[int, int]
     ) -> Tuple[Optional[np.ndarray], Optional[List[int]], Optional[List[int]], Optional[np.ndarray], Optional[np.ndarray]]:
-        return self._default_load_latents_from_disk(8, npz_path, bucket_reso)
+        # bucket_reso is (W, H) for the image
+        return self._default_load_latents_from_disk(
+            latents_stride=self.FLUX_VAE_DOWNSCALE_FACTOR, # Pass the correct stride
+            npz_path=npz_path,
+            bucket_reso=bucket_reso
+        )
 
-    # This method specifically overrides the one from LatentsCachingStrategy (or its _default)
     def cache_batch_latents(self,
-                            vae: flux_models.AutoEncoder, # Specific type hint for clarity
+                            vae: flux_models.AutoEncoder, 
                             image_infos: List[train_util.ImageInfo],
                             flip_aug: bool,
                             alpha_mask: bool,
                             random_crop: bool):
-
-        # flux_models.AutoEncoder.encode() returns the latent tensor directly
-        # (after internal sampling if its DiagonalGaussian is configured to sample)
         encode_by_vae_func = lambda img_tensor: vae.encode(img_tensor).to("cpu")
-
         vae_device = vae.device
         vae_dtype = vae.dtype
-
-        # Call the _default_cache_batch_latents from the base class,
-        # but provide our corrected encode_by_vae_func
         super()._default_cache_batch_latents(
             encode_by_vae_func,
             vae_device,
@@ -97,9 +95,8 @@ class FluxLatentsCachingStrategy(LatentsCachingStrategy):
             flip_aug,
             alpha_mask,
             random_crop,
-            multi_resolution=True # Assuming this is still desired
+            multi_resolution=True 
         )
-
         if not train_util.HIGH_VRAM:
             train_util.clean_memory_on_device(vae.device)
 
