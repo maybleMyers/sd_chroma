@@ -41,6 +41,14 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.train_clip_l: bool = False  # Initialize here
         self.train_t5xxl: bool = False # Initialize here
 
+    def post_process_network(self, args, accelerator, network, text_encoders, unet):
+        """
+        Post-processing for the network after it's created and before it's applied.
+        For Flux LoRA, typically no extra steps are needed here as LoRA application
+        handles the necessary integration.
+        """
+        pass
+    
     def get_text_encoder_outputs_caching_strategy(self, args):
         if args.cache_text_encoder_outputs:
             if self.model_type_str is None and args.pretrained_model_name_or_path: # Ensure model_type_str is available
