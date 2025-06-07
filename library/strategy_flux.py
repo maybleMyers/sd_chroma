@@ -236,8 +236,13 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         try:
             with np.load(npz_path) as npz:
                 if "t5_out" not in npz or "txt_ids" not in npz: return False
-                if "t5_attn_mask" in npz and "apply_t5_attn_mask" not in npz: return False
-                if "apply_t5_attn_mask" in npz and npz["apply_t5_attn_mask"] != self.apply_t5_attn_mask: return False
+                # If t5_attn_mask was saved, apply_t5_attn_mask should also have been saved.
+                # And their values should match the current strategy's expectation.
+                t5_mask_present_in_npz = "t5_attn_mask" in npz
+                apply_t5_mask_key_present_in_npz = "apply_t5_attn_mask" in npz
+
+                if t5_mask_present_in_npz != apply_t5_mask_key_present_in_npz : return False # Should be saved together or not at all
+                if apply_t5_mask_key_present_in_npz and npz["apply_t5_attn_mask"] != self.apply_t5_attn_mask: return False
         except Exception as e:
             logger.error(f"Error loading or validating cache file: {npz_path}, Error: {e}")
             return False

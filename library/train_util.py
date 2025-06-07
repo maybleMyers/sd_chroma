@@ -1733,17 +1733,87 @@ class BaseDataset(torch.utils.data.Dataset):
             input_ids_list.append(input_ids)
             captions.append(caption)
 
-        def none_or_stack_elements(tensors_list, converter):
-            # [[clip_l, clip_g, t5xxl], [clip_l, clip_g, t5xxl], ...] -> [torch.stack(clip_l), torch.stack(clip_g), torch.stack(t5xxl)]
-            if len(tensors_list) == 0 or tensors_list[0] == None or len(tensors_list[0]) == 0 or tensors_list[0][0] is None:
+        def none_or_stack_elements(tensors_list_of_lists: List[Optional[List[Any]]], converter_map_or_fn: Union[Callable, List[Callable]]):
+            if not tensors_list_of_lists or all(item_list is None for item_list in tensors_list_of_lists):
                 return None
-            return [torch.stack([converter(x[i]) for x in tensors_list]) for i in range(len(tensors_list[0]))]
+
+            first_valid_item_list = next((item for item in tensors_list_of_lists if item is not None and isinstance(item, list)), None)
+            if first_valid_item_list is None:
+                # All items were None or not lists, which is unexpected if we expect list of lists.
+                # For the TE output case (list of lists), this means no valid structure was found.
+                # It could also be that tensors_list_of_lists was a flat list of tensors/None,
+                # in which case this function is not appropriate.
+                logger.debug("none_or_stack_elements: No valid list of components found in input or input is not a list of lists.")
+                return None
+            
+            num_components = len(first_valid_item_list)
+            if num_components == 0:
+                logger.debug("none_or_stack_elements: Input was list of empty lists.")
+                return [] # Input was list of empty lists.
+
+            final_batched_components = []
+            for i in range(num_components):
+                raw_component_data_for_batch = []
+                for item_list_idx, item_list in enumerate(tensors_list_of_lists):
+                    if item_list is not None and isinstance(item_list, list) and i < len(item_list):
+                        raw_component_data_for_batch.append(item_list[i])
+                    elif item_list is None or not isinstance(item_list, list):
+                        # This item in the batch is None or not a list of components, problematic for consistent stacking.
+                        logger.warning(f"none_or_stack_elements: Item at batch index {item_list_idx} is None or not a list. Adding None for component {i}.")
+                        raw_component_data_for_batch.append(None)
+                    else: # item_list is a list, but shorter than num_components
+                        logger.warning(f"none_or_stack_elements: Item at batch index {item_list_idx} has too few components (expected {num_components}, got {len(item_list)}). Adding None for component {i}.")
+                        raw_component_data_for_batch.append(None)
+
+                current_converter = converter_map_or_fn
+                if isinstance(converter_map_or_fn, list):
+                    current_converter = converter_map_or_fn[i] if i < len(converter_map_or_fn) else lambda x_conv: x_conv # Default to identity if not enough converters
+                
+                converted_component_data_for_batch = []
+                component_has_any_non_none_data = False
+                for data_point_idx, data_point in enumerate(raw_component_data_for_batch):
+                    if data_point is not None:
+                        try:
+                            converted_data = current_converter(data_point)
+                            converted_component_data_for_batch.append(converted_data)
+                            if converted_data is not None: # Check after conversion
+                                component_has_any_non_none_data = True
+                        except Exception as e_conv:
+                            logger.error(f"Error converting component {i}, batch item {data_point_idx}, data '{str(data_point)[:50]}': {e_conv}")
+                            converted_component_data_for_batch.append(None) # Add None on error
+                    else:
+                        converted_component_data_for_batch.append(None)
+                
+                if not component_has_any_non_none_data: # All data for this component (after conversion) is None
+                    final_batched_components.append(None)
+                elif any(item is None for item in converted_component_data_for_batch): # Mixed None and Tensors for this component
+                    logger.warning(f"Component {i} has None values for some items after conversion. Setting batched component to None for this component.")
+                    final_batched_components.append(None)
+                else: # All items for this component are (presumably) Tensors
+                    try:
+                        final_batched_components.append(torch.stack(converted_component_data_for_batch))
+                    except Exception as e_stack:
+                        # Log details about shapes if stacking fails
+                        shapes_str = ", ".join([f"{type(x).__name__}({x.shape if hasattr(x, 'shape') else 'NoShape'})" for x in converted_component_data_for_batch])
+                        logger.error(f"Error stacking component {i}. Data types/shapes: [{shapes_str}]. Error: {e_stack}. Setting component to None.")
+                        final_batched_components.append(None)
+            
+            return final_batched_components if not all(c is None for c in final_batched_components) else None
 
         # set example
         example = {}
         example["custom_attributes"] = custom_attributes  # may be list of empty dict
         example["loss_weights"] = torch.FloatTensor(loss_weights)
-        example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, torch.FloatTensor)
+
+        # Define converters for Flux TE outputs: [l_pooled (fp), t5_out (fp), txt_ids (long), t5_attn_mask (bool)]
+        # Ensure numpy arrays are converted to tensors of the correct dtype.
+        flux_te_converters = [
+            lambda x: torch.from_numpy(x).to(torch.float32) if x is not None else None,  # l_pooled
+            lambda x: torch.from_numpy(x).to(torch.float32) if x is not None else None,  # t5_out
+            lambda x: torch.from_numpy(x).to(torch.long) if x is not None else None,     # txt_ids
+            lambda x: torch.from_numpy(x).to(torch.bool) if x is not None else None,    # t5_attn_mask (assuming it's saved as int/byte that can convert to bool)
+        ]
+        example["text_encoder_outputs_list"] = none_or_stack_elements(text_encoder_outputs_list, flux_te_converters)
         example["input_ids_list"] = none_or_stack_elements(input_ids_list, lambda x: x)
 
         # if one of alpha_masks is not None, we need to replace None with ones
