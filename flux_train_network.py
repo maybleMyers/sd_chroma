@@ -48,6 +48,16 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         handles the necessary integration.
         """
         pass
+
+    def is_train_text_encoder(self, args):
+        """
+        Determines if any text encoder (CLIP-L or T5XXL) is set to be trained.
+        This relies on self.train_clip_l and self.train_t5xxl which are
+        determined in self.assert_extra_args based on args.network_train_unet_only
+        and the model type.
+        """
+        # These flags are set in assert_extra_args
+        return self.train_clip_l or self.train_t5xxl
     
     def get_text_encoder_outputs_caching_strategy(self, args):
         if args.cache_text_encoder_outputs:
