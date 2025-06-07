@@ -40,7 +40,17 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.is_swapping_blocks: bool = False
         self.train_clip_l: bool = False  # Initialize here
         self.train_t5xxl: bool = False # Initialize here
-
+    def prepare_unet_with_accelerator(
+        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module # unet is the FLUX model here
+    ) -> torch.nn.Module:
+        """
+        Prepares the U-Net (FLUX model in this case) with the accelerator.
+        The default behavior from the parent class is usually sufficient.
+        """
+        logger.info(f"Preparing FLUX model (U-Net) with accelerator. Original device: {unet.device}")
+        prepared_unet = accelerator.prepare(unet)
+        logger.info(f"FLUX model (U-Net) prepared. New device: {prepared_unet.device}")
+        return prepared_unet
     def post_process_network(self, args, accelerator, network, text_encoders, unet):
         """
         Post-processing for the network after it's created and before it's applied.
