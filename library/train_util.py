@@ -2142,6 +2142,7 @@ class DreamBoothDataset(BaseDataset):
         self.num_reg_images = num_reg_images
 
 class FineTuningDataset(BaseDataset):
+    # __init__ from your provided file, with the change to NOT set .latents_npz / .text_encoder_outputs_npz initially
     def __init__(
         self,
         subsets: Sequence[FineTuningSubset],
@@ -2154,7 +2155,7 @@ class FineTuningDataset(BaseDataset):
         bucket_reso_steps: int,
         bucket_no_upscale: bool,
         debug_dataset: bool,
-        validation_seed: Optional[int], # Changed to Optional[int]
+        validation_seed: Optional[int], 
         validation_split: float,
         resize_interpolation: Optional[str],
     ) -> None:
@@ -2165,17 +2166,29 @@ class FineTuningDataset(BaseDataset):
 
         self.num_train_images = 0
         self.num_reg_images = 0 
+        
+        # This will be a flat list of all ImageInfo objects from all subsets.
+        # Bucketing will later organize views into this.
+        # self.image_data: Dict[str, ImageInfo] is already in BaseDataset
 
-        for subset in subsets:
-            # ... (subset skipping logic as before) ...
+        for subset_idx, subset in enumerate(subsets):
             if subset.num_repeats < 1:
                 logger.warning(
                     f"ignore subset with metadata_file='{subset.metadata_file}': num_repeats is less than 1 / num_repeatsが1を下回っているためサブセットを無視します: {subset.num_repeats}"
                 )
                 continue
-            if subset in self.subsets:
+            # Simple check for duplicate subset definition based on metadata_file path.
+            # This might need to be more robust if subsets can be identical but are different objects.
+            # For now, assuming subset objects are unique if their config differs or they are distinct entries.
+            # self.subsets is on BaseDataset
+            is_duplicate_subset_def = False
+            for existing_s in self.subsets:
+                if isinstance(existing_s, FineTuningSubset) and existing_s.metadata_file == subset.metadata_file :
+                    is_duplicate_subset_def = True
+                    break
+            if is_duplicate_subset_def:
                 logger.warning(
-                    f"ignore duplicated subset with metadata_file='{subset.metadata_file}': use the first one / 既にサブセットが登録されているため、重複した後発のサブセットを無視します"
+                    f"ignore duplicated subset definition with metadata_file='{subset.metadata_file}': use the first one / 既にサブセット定義が登録されているため、重複した後発のサブセット定義を無視します"
                 )
                 continue
             
@@ -2184,34 +2197,44 @@ class FineTuningDataset(BaseDataset):
                 with open(subset.metadata_file, "rt", encoding="utf-8") as f:
                     metadata = json.load(f)
             else:
-                raise ValueError(f"no metadata / メタデータファイルがありません: {subset.metadata_file}")
+                logger.error(f"metadata file not found / メタデータファイルがありません: {subset.metadata_file}") # Changed to error
+                # Optionally, raise ValueError here if metadata is critical
+                continue # Skip this subset
 
-            if len(metadata) < 1: #...
+            if len(metadata) < 1:
+                logger.warning(
+                    f"ignore subset with '{subset.metadata_file}': no image entries found / 画像に関するデータが見つからないためサブセットを無視します"
+                )
                 continue
 
             tags_list_for_subset_freq = []
+            current_subset_img_count = 0
             for image_key, img_md in metadata.items():
                 abs_path = None
-                # ... (abs_path determination logic as before) ...
+                # Determine absolute path based on image_key and subset.image_dir
                 if subset.image_dir: 
                     candidate_path = os.path.join(subset.image_dir, image_key)
                     if os.path.exists(candidate_path):
                         abs_path = candidate_path
-                    else: 
-                        if os.path.exists(image_key): abs_path = image_key
+                    # Fallback: if image_key itself is a path that exists (e.g. metadata uses relative paths from metadata file loc)
+                    elif os.path.exists(os.path.join(os.path.dirname(subset.metadata_file), image_key)):
+                         abs_path = os.path.join(os.path.dirname(subset.metadata_file), image_key)
+                    elif os.path.exists(image_key): # Fallback: image_key is absolute or relative to cwd
+                         abs_path = image_key
                 elif os.path.exists(image_key): 
                     abs_path = image_key
                 
-                if abs_path is None:
+                # Fallback for old direct .npz latents if image not found (less relevant for new caching)
+                if abs_path is None and not abs_path_has_image_extension(image_key): # Only try .npz if image_key isn't already an image
                     base_key_no_ext = os.path.splitext(image_key)[0]
-                    npz_candidate = base_key_no_ext + ".npz" # This seems to be for old direct .npz latents, not the strategy one
+                    npz_candidate = base_key_no_ext + ".npz" 
                     if subset.image_dir and os.path.exists(os.path.join(subset.image_dir, npz_candidate)):
                         abs_path = os.path.join(subset.image_dir, npz_candidate) 
                     elif os.path.exists(npz_candidate):
                         abs_path = npz_candidate
 
                 if abs_path is None:
-                    logger.warning(f"Image/npz not found for key: {image_key} in metadata {subset.metadata_file}. Looked in {subset.image_dir if subset.image_dir else 'current dir/abs paths'}. Skipping.")
+                    logger.warning(f"Image/npz not found for key: {image_key} in metadata {subset.metadata_file}. Looked in '{subset.image_dir if subset.image_dir else os.path.dirname(subset.metadata_file)}' and CWD. Skipping.")
                     continue
                 abs_path = os.path.abspath(abs_path)
 
@@ -2220,30 +2243,35 @@ class FineTuningDataset(BaseDataset):
                 # ... (caption and tags merging logic as before) ...
                 if caption is None and tags is not None: caption = tags
                 elif caption is not None and tags is not None:
+                    processed_tags = tags.strip().replace("\n", subset.caption_separator if subset.caption_separator else ",")
                     if subset.enable_wildcard: 
-                        tags_processed = tags.replace("\n", subset.caption_separator if subset.caption_separator else ",")
                         caption = "\n".join(
-                            [f"{line.strip()}{(subset.caption_separator if subset.caption_separator else ',')}{tags_processed}" for line in caption.split("\n") if line.strip()]
+                            [f"{line.strip()}{(subset.caption_separator if subset.caption_separator else ',')}{processed_tags}" for line in caption.split("\n") if line.strip()]
                         )
                     else: 
-                        caption = caption.strip() + (subset.caption_separator if subset.caption_separator else ",") + tags.strip()
+                        caption = caption.strip() + (subset.caption_separator if subset.caption_separator else ",") + processed_tags
                 if caption is None: caption = ""
                 if tags is not None: 
                     tags_list_for_subset_freq.extend(tag.strip() for tag_part in tags.split(subset.caption_separator if subset.caption_separator else ",") for tag in tag_part.split('\n') if tag.strip())
 
-                image_info = ImageInfo(image_key, subset.num_repeats, caption, False, abs_path)
-                # Store original_size from metadata if available, or it will be loaded in make_buckets
+                # Use a unique key for self.image_data if multiple subsets might have the same image_key (filename)
+                # e.g., by prepending subset identifier or using absolute_path as key if truly unique
+                unique_image_data_key = abs_path # Assuming absolute_path is unique across all images from all subsets
+
+                if unique_image_data_key in self.image_data:
+                    logger.warning(f"Duplicate image_data_key '{unique_image_data_key}' (from image_key '{image_key}' in subset '{subset.metadata_file}'). Skipping this entry.")
+                    continue
+
+                image_info = ImageInfo(unique_image_data_key, subset.num_repeats, caption, False, abs_path) 
                 image_info.image_size = img_md.get("train_resolution") # [width, height] 
                 image_info.resize_interpolation = subset.resize_interpolation if subset.resize_interpolation is not None else self.resize_interpolation
                 
-                # DO NOT set image_info.latents_npz or image_info.text_encoder_outputs_npz here
-                # They will be set in make_buckets after bucket assignment.
-
                 self.register_image(image_info, subset) 
+                current_subset_img_count +=1
 
-            self.num_train_images += len(self.image_data) * subset.num_repeats # Approximation, needs refinement based on actual items registered
+            self.num_train_images += current_subset_img_count * subset.num_repeats
             self.set_tag_frequency(os.path.basename(subset.metadata_file), tags_list_for_subset_freq)
-            subset.img_count = sum(1 for info_key in self.image_data if self.image_to_subset[info_key] == subset)
+            subset.img_count = current_subset_img_count # Actual number of images registered from this subset
             self.subsets.append(subset)
 
         # Bucket related setup
@@ -2251,20 +2279,24 @@ class FineTuningDataset(BaseDataset):
         if self.enable_bucket:
             actual_resolution_for_bucketing = resolution
             if actual_resolution_for_bucketing is None:
-                if not all(info.image_size for info in self.image_data.values()): # Check if all have 'train_resolution'
+                if not all(info.image_size for info in self.image_data.values()):
                      raise ValueError("Resolution must be provided for bucketing if not all images have 'train_resolution' in metadata.")
-                # Use the provided resolution arg as the max_reso for BucketManager
-                # self.width, self.height will be set from resolution arg
             
-            # Ensure self.width and self.height are set if resolution is provided
             if resolution:
                 self.width, self.height = resolution
-            elif not (self.width and self.height): # Should not happen if previous checks passed
-                 raise ValueError("Dataset resolution (self.width, self.height) not set for bucketing.")
+            elif not (self.width and self.height):
+                 # Try to infer from dataset if a consistent resolution exists, otherwise error.
+                all_resos = [info.image_size for info in self.image_data.values() if info.image_size]
+                if not all_resos: raise ValueError("Cannot determine dataset resolution for bucketing.")
+                first_reso = all_resos[0]
+                if not all(r == first_reso for r in all_resos):
+                    logger.warning("Images have varying 'train_resolution' in metadata. Using the first one for bucketing parameters. Ensure 'resolution' arg is set if this is not intended.")
+                self.width, self.height = first_reso
+                logger.info(f"Inferred dataset resolution for bucketing as {self.width}x{self.height} from first image.")
 
 
             min_bucket_reso, max_bucket_reso = self.adjust_min_max_bucket_reso_by_steps(
-                (self.width, self.height), min_bucket_reso, max_bucket_reso, bucket_reso_steps # Pass dataset target resolution
+                (self.width, self.height), min_bucket_reso, max_bucket_reso, bucket_reso_steps 
             )
             self.min_bucket_reso = min_bucket_reso
             self.max_bucket_reso = max_bucket_reso
@@ -2274,79 +2306,99 @@ class FineTuningDataset(BaseDataset):
             if resolution is None:
                 raise ValueError("`resolution` must be specified if `enable_bucket` is False.")
             self.width, self.height = resolution
-            # ... (other non-bucket fields as before)
+            self.min_bucket_reso = None
+            self.max_bucket_reso = None
+            self.bucket_reso_steps = None
+            self.bucket_no_upscale = False
 
     def make_buckets(self):
-        logger.info("loading image sizes.")
-        for info_key, info_obj in tqdm(self.image_data.items()):
-            if info_obj.image_size is None: # If not set from metadata's 'train_resolution'
-                info_obj.image_size = self.get_image_size(info_obj.absolute_path)
+        logger.info("loading image sizes for make_buckets.")
+        for info_key, info_obj in tqdm(self.image_data.items()): # Iterates over unique_image_data_key
+            if info_obj.image_size is None: 
+                info_obj.image_size = self.get_image_size(info_obj.absolute_path) # Get actual size from disk if not in metadata
 
         if self.enable_bucket:
             logger.info("make buckets")
             if self.bucket_manager is None:
                 self.bucket_manager = BucketManager(
                     self.bucket_no_upscale,
-                    (self.width, self.height), # Target overall resolution for bucketing range
+                    (self.width, self.height), 
                     self.min_bucket_reso,
                     self.max_bucket_reso,
                     self.bucket_reso_steps,
                 )
                 if not self.bucket_no_upscale:
                     self.bucket_manager.make_buckets()
-                # else: logger.warning(...) # Already logged
 
             img_ar_errors = []
-            for image_info in self.image_data.values():
-                image_width, image_height = image_info.image_size # This is original/metadata size
-                # Determine bucket assignment
-                image_info.bucket_reso, image_info.resized_size, ar_error = self.bucket_manager.select_bucket(
+            # THIS IS THE CRITICAL LOOP FOR UPDATING ImageInfo OBJECTS IN self.image_data
+            for image_key, image_info_obj in self.image_data.items(): # image_key is unique_image_data_key (abs_path)
+                # image_info.image_size should be original W,H from disk or metadata at this point
+                if image_info_obj.image_size is None: # Should have been loaded above
+                    logger.error(f"CRITICAL: image_size for {image_key} is None before bucket selection.")
+                    # Fallback or skip
+                    image_info_obj.image_size = (self.width, self.height) # Default to dataset resolution
+
+                image_width, image_height = image_info_obj.image_size 
+                
+                # Determine bucket assignment based on original/metadata size
+                bucket_reso_for_this_image, resized_size_for_this_image, ar_error = self.bucket_manager.select_bucket(
                     image_width, image_height
                 )
-                # NOW, set image_size to bucket_reso for path generation, and generate paths
-                image_info.image_size = image_info.bucket_reso # CRITICAL: Update info.image_size
+                image_info_obj.bucket_reso = bucket_reso_for_this_image
+                image_info_obj.resized_size = resized_size_for_this_image
                 
+                # CRITICAL: After bucket_reso is determined, this is the image_size for caching purposes.
+                # Update image_info_obj.image_size to reflect the bucket resolution it will be processed at.
+                # This ensures get_latents_npz_path uses the correct dimensions for the NPZ filename.
+                # image_info_obj.image_size = image_info_obj.bucket_reso # This was previous fix attempt.
+
+                # Generate cache paths using the determined BUCKET resolution
                 if self.latents_caching_strategy:
-                    image_info.latents_npz = self.latents_caching_strategy.get_latents_npz_path(
-                        image_info.absolute_path, image_info.bucket_reso # Use bucket_reso for path
+                    # Pass image_info_obj.bucket_reso as the 'image_size' argument for path generation
+                    image_info_obj.latents_npz = self.latents_caching_strategy.get_latents_npz_path(
+                        image_info_obj.absolute_path, image_info_obj.bucket_reso 
                     )
                 if self.text_encoder_output_caching_strategy:
-                    image_info.text_encoder_outputs_npz = self.text_encoder_output_caching_strategy.get_outputs_npz_path(
-                        image_info.absolute_path
+                    image_info_obj.text_encoder_outputs_npz = self.text_encoder_output_caching_strategy.get_outputs_npz_path(
+                        image_info_obj.absolute_path
                     )
                 img_ar_errors.append(abs(ar_error))
             self.bucket_manager.sort()
         else: # Not bucketing
             self.bucket_manager = BucketManager(False, (self.width, self.height), None, None, None)
             self.bucket_manager.set_predefined_resos([(self.width, self.height)])
-            for image_info in self.image_data.values():
-                image_width, image_height = image_info.image_size
-                image_info.bucket_reso, image_info.resized_size, _ = self.bucket_manager.select_bucket(image_width, image_height)
-                image_info.image_size = image_info.bucket_reso # Update info.image_size
+            for image_key, image_info_obj in self.image_data.items():
+                if image_info_obj.image_size is None:
+                    image_info_obj.image_size = (self.width, self.height)
+                
+                image_width, image_height = image_info_obj.image_size
+                image_info_obj.bucket_reso, image_info_obj.resized_size, _ = self.bucket_manager.select_bucket(image_width, image_height)
+                # image_info_obj.image_size = image_info_obj.bucket_reso # Already target res if not bucketing
 
                 if self.latents_caching_strategy:
-                    image_info.latents_npz = self.latents_caching_strategy.get_latents_npz_path(
-                        image_info.absolute_path, image_info.bucket_reso
+                    image_info_obj.latents_npz = self.latents_caching_strategy.get_latents_npz_path(
+                        image_info_obj.absolute_path, image_info_obj.bucket_reso # Use bucket_reso (which is dataset target reso)
                     )
                 if self.text_encoder_output_caching_strategy:
-                    image_info.text_encoder_outputs_npz = self.text_encoder_output_caching_strategy.get_outputs_npz_path(
-                        image_info.absolute_path
+                    image_info_obj.text_encoder_outputs_npz = self.text_encoder_output_caching_strategy.get_outputs_npz_path(
+                        image_info_obj.absolute_path
                     )
 
-        # Populate buckets in bucket_manager
-        for image_info in self.image_data.values():
-            for _ in range(image_info.num_repeats):
-                self.bucket_manager.add_image(image_info.bucket_reso, image_info.image_key)
+        # Populate bucket_manager.buckets with image_keys (unique_image_data_key)
+        for image_key, image_info_obj in self.image_data.items():
+            for _ in range(image_info_obj.num_repeats):
+                self.bucket_manager.add_image(image_info_obj.bucket_reso, image_key) # image_key is unique_image_data_key
 
-        # ... (rest of make_buckets logic for bucket_info, buckets_indices, shuffle, _length as before)
+        # ... (rest of make_buckets: bucket_info logging, buckets_indices, shuffle, _length)
         if self.enable_bucket:
             self.bucket_info = {"buckets": {}}
             logger.info("number of images (including repeats) / 各bucketの画像枚数（繰り返し回数を含む）")
-            for i, (reso, bucket_content) in enumerate(zip(self.bucket_manager.resos, self.bucket_manager.buckets)):
-                count = len(bucket_content)
+            for i, (reso, bucket_content_keys) in enumerate(zip(self.bucket_manager.resos, self.bucket_manager.buckets)):
+                count = len(bucket_content_keys)
                 if count > 0:
-                    self.bucket_info["buckets"][i] = {"resolution": reso, "count": len(bucket_content)}
-                    logger.info(f"bucket {i}: resolution {reso}, count: {len(bucket_content)}")
+                    self.bucket_info["buckets"][i] = {"resolution": reso, "count": len(bucket_content_keys)}
+                    logger.info(f"bucket {i}: resolution {reso}, count: {len(bucket_content_keys)}")
             if len(img_ar_errors) == 0: mean_img_ar_error = 0 
             else: mean_img_ar_error = np.mean(np.abs(np.array(img_ar_errors)))
             self.bucket_info["mean_img_ar_error"] = mean_img_ar_error
@@ -2354,12 +2406,29 @@ class FineTuningDataset(BaseDataset):
 
         self.buckets_indices: List[BucketBatchIndex] = []
         for bucket_idx, bucket_content_keys in enumerate(self.bucket_manager.buckets):
-            batch_count = int(math.ceil(len(bucket_content_keys) / self.batch_size))
+            # Ensure self.batch_size is positive
+            current_batch_size = self.batch_size if self.batch_size > 0 else 1
+            batch_count = int(math.ceil(len(bucket_content_keys) / current_batch_size))
             for batch_idx_in_bucket in range(batch_count):
-                self.buckets_indices.append(BucketBatchIndex(bucket_idx, self.batch_size, batch_idx_in_bucket))
+                self.buckets_indices.append(BucketBatchIndex(bucket_idx, current_batch_size, batch_idx_in_bucket))
         
         self.shuffle_buckets()
         self._length = len(self.buckets_indices)
+
+    def _get_image_info(self, index: int) -> ImageInfo:
+        # This method is called by __getitem__ to get a *copy* of the ImageInfo
+        # for the specific image being loaded in the current batch.
+        # self.image_keys should be populated by make_buckets() or similar, containing unique image_data_keys for the current batch index.
+        
+        # Determine which image_key from a bucket this current dataloader index maps to.
+        # This requires knowing the current bucket and the position within that bucket's batch.
+        bucket_batch_info = self.buckets_indices[index]
+        bucket_idx = bucket_batch_info.bucket_index
+        batch_idx_in_bucket = bucket_batch_info.batch_index
+        bucket_batch_size = bucket_batch_info.bucket_batch_size # This is the dataset's overall batch_size
+
+        # Get the list of image_keys for the current bucket
+        image_keys_in_current_bucket = self.bucket_manager.buckets[bucket_idx]
 
     def image_key_to_npz_file(self, subset: FineTuningSubset, image_key):
         # This method seems specific to how latents were cached in older system (direct .npz next to image)
