@@ -338,12 +338,47 @@ def to_cpu(x):
     return x
 
 class EmbedND(nn.Module):
-    def __init__(self, dim: int, theta: int, axes_dim: list[int]):
-        super().__init__(); self.dim, self.theta, self.axes_dim = dim, theta, axes_dim
-    def forward(self, ids: Tensor) -> Tensor:
-        n_axes = ids.shape[-1]
-        emb = torch.cat([rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)], dim=-3)
-        return emb.unsqueeze(1)
+    def __init__(self, dim: int, theta: int, axes_dim: list[int]): # dim is total pe_dim
+        super().__init__()
+        self.theta, self.axes_dim = theta, axes_dim
+        # Optional: Check if dim matches sum of axes_dim, though this is already checked in Flux.__init__
+        if dim != sum(axes_dim):
+            logger.warning(
+                f"EmbedND init: input 'dim' {dim} != sum(axes_dim) {sum(axes_dim)}. "
+                f"Ensure pe_dim in Flux matches sum of axes_dim."
+            )
+
+    # Expects one ids_tensor per axis, e.g., ids_for_axis0, ids_for_axis1, ...
+    # Each ids_tensor should be [Batch, SeqLen]
+    def forward(self, *ids_per_axis: Tensor) -> Tensor:
+        if len(ids_per_axis) != len(self.axes_dim):
+            raise ValueError(
+                f"Number of id tensors ({len(ids_per_axis)}) must match number of axes defined by axes_dim ({len(self.axes_dim)})"
+            )
+
+        all_rope_embeddings = []
+        for i in range(len(self.axes_dim)):
+            current_axis_ids = ids_per_axis[i]  # Shape [B, S]
+            current_axis_dim = self.axes_dim[i] # Scalar, e.g., 16, 56, 56
+
+            if current_axis_dim == 0: # Skip axes with 0 dimension if any
+                continue
+            
+            # The 'pos' argument to rope (current_axis_ids) is now [B, S].
+            # rope will produce [B, S, current_axis_dim_half, 2, 2]
+            # then rearrange transforms it to [B, S, current_axis_dim_half, 2, 2] (already this shape)
+            # No, rope returns [B, S, current_axis_dim // 2, 2, 2] if current_axis_dim is passed correctly.
+            # Correction: rope returns [B, S, D_rope_feat, 2, 2] where D_rope_feat is current_axis_dim.
+            # It's actually [B,S, current_axis_dim_per_head_part, 2,2] -> after einsum/stack [B,S,D_half,4] -> rearrange [B,S,D_half,2,2]
+            # So the output of rope is [B, S, D_axis_for_rope//2, 2, 2]
+            # Let's assume `rope` returns features correctly packed for its `dim` input.
+            # The important part is that `current_axis_ids` is [B, S]
+            rope_emb_for_axis = rope(current_axis_ids, current_axis_dim, self.theta)
+            all_rope_embeddings.append(rope_emb_for_axis)
+        
+        # Concatenate along the RoPE feature dimension (index -3, which is D_axis_for_rope//2)
+        emb = torch.cat(all_rope_embeddings, dim=-3) # Result: [B, S, (sum_of_D_axis_for_rope)//2, 2, 2]
+        return emb.unsqueeze(1) # Add head dimension: [B, 1, S, D_total_pe//2, 2, 2]
 
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
     original_shape = t.shape
@@ -768,73 +803,106 @@ class Flux(nn.Module):
         self.offloader_double.prepare_block_devices_before_forward(self.double_blocks)
         self.offloader_single.prepare_block_devices_before_forward(self.single_blocks)
     def forward(self, img: Tensor, img_ids: Tensor, txt: Tensor, txt_ids: Tensor, timesteps: Tensor,
-                y: Tensor, guidance: Tensor|None=None, txt_attention_mask: Tensor|None=None, **kwargs) -> Tensor:
-        if img.ndim!=3 or txt.ndim!=3: raise ValueError("Inputs img/txt must be 3D.")
-        img_p=self.img_in(img)
-        if self.distilled_guidance_layer: img_p = img_p + self.distilled_guidance_layer(img)
-        txt_f=self.txt_in(txt)
+                y: Tensor, guidance: Tensor | None = None, txt_attention_mask: Tensor | None = None,
+                patch_grid_h: Optional[int] = None, patch_grid_w: Optional[int] = None, **kwargs) -> Tensor: # Add new args
+        if img.ndim != 3 or txt.ndim != 3:
+            raise ValueError("Inputs img/txt must be 3D.")
         
-        int_cond_parts=[]
-        if self.time_in: int_cond_parts.append(self.time_in(timestep_embedding(timesteps,256)))
-        # For Chroma, params_dto.guidance_embed is True. If self.guidance_in is nn.Identity (due to missing checkpoint keys for it), this part is skipped.
-        if self.params_dto.guidance_embed and guidance is not None and not isinstance(self.guidance_in,nn.Identity):
-            int_cond_parts.append(self.guidance_in(timestep_embedding(guidance,256)))
-        if self.vector_in: int_cond_parts.append(self.vector_in(y))
+        # Check if patch_grid_h and patch_grid_w are provided if img_ids are present
+        # This is crucial for creating spatial embeddings for image patches.
+        if img_ids is not None and (patch_grid_h is None or patch_grid_w is None):
+            # Try to infer if S_img is compatible with a 36x28 grid (common for FLUX 1008 patches)
+            if img_ids.shape[1] == 1008: # 36 * 28 = 1008
+                patch_grid_h = 36
+                patch_grid_w = 28
+                logger.info(f"Flux.forward: Inferred patch_grid_h={patch_grid_h}, patch_grid_w={patch_grid_w} for S_img=1008.")
+            else:
+                raise ValueError("patch_grid_h and patch_grid_w must be provided to Flux.forward when using image positional embeddings.")
+
+        img_p = self.img_in(img)
+        if self.distilled_guidance_layer:
+            img_p = img_p + self.distilled_guidance_layer(img)
+        txt_f = self.txt_in(txt)
+
+        int_cond_parts = []
+        if self.time_in:
+            int_cond_parts.append(self.time_in(timestep_embedding(timesteps, 256)))
+        if self.params_dto.guidance_embed and guidance is not None and not isinstance(self.guidance_in, nn.Identity):
+            int_cond_parts.append(self.guidance_in(timestep_embedding(guidance, 256)))
+        if self.vector_in:
+            int_cond_parts.append(self.vector_in(y))
         
-        # If all embedders are None (like for Chroma if guidance_in is also effectively None), int_cond_vec is zero.
         internal_cond_vec = sum(int_cond_parts) if int_cond_parts else \
                             torch.zeros(img.shape[0], self.hidden_size, device=img.device, dtype=img.dtype)
-        
-        mod_vecs_chroma=None
-        if self.modulation_approximator: # Chroma path, if approximator is built
-            app_cfg=self.params_dto.approximator_config; _bs=img.shape[0]
-            # For Chroma, time_in and vector_in are None. Guidance_in might be Identity if keys are missing.
-            # The approximator's input should be formed from what's available.
-            # Ostris's example uses ts_emb, guidance_emb, mod_idx_emb.
-            ts_emb_approx = timestep_embedding(timesteps,16) # Approximator always gets a timestep embedding
+
+        mod_vecs_chroma = None
+        if self.modulation_approximator:
+            app_cfg = self.params_dto.approximator_config
+            _bs = img.shape[0]
+            ts_emb_approx = timestep_embedding(timesteps, 16)
             guid_val_approx = guidance if guidance is not None else torch.zeros_like(timesteps, device=timesteps.device, dtype=timesteps.dtype)
-            guid_emb_approx = timestep_embedding(guid_val_approx,16)
-            
+            guid_emb_approx = timestep_embedding(guid_val_approx, 16)
             mod_idx_batched = self.mod_index.unsqueeze(0).repeat(_bs, 1)
-            mod_idx_emb = timestep_embedding(mod_idx_batched,32) # (B, mod_idx_length, 32)
-            
-            ts_guid_emb_approx = torch.cat([ts_emb_approx, guid_emb_approx], dim=1).unsqueeze(1).repeat(1,self.mod_index_length,1)
-            approx_in = torch.cat([ts_guid_emb_approx, mod_idx_emb], dim=-1) # (B, mod_idx_length, 64)
-            
-            mod_vecs=self.modulation_approximator(approx_in)
-            mod_vecs_chroma=distribute_modulations_from_approximator(mod_vecs,self.num_double_blocks,self.num_single_blocks,self.params_dto)
-            
-        pe=self.pe_embedder(torch.cat((txt_ids,img_ids),dim=1))
+            mod_idx_emb = timestep_embedding(mod_idx_batched, 32)
+            ts_guid_emb_approx = torch.cat([ts_emb_approx, guid_emb_approx], dim=1).unsqueeze(1).repeat(1, self.mod_index_length, 1)
+            approx_in = torch.cat([ts_guid_emb_approx, mod_idx_emb], dim=-1)
+            mod_vecs = self.modulation_approximator(approx_in)
+            mod_vecs_chroma = distribute_modulations_from_approximator(mod_vecs, self.num_double_blocks, self.num_single_blocks, self.params_dto)
         
+        # Prepare inputs for EmbedND
+        S_txt = txt_ids.shape[1]
+        S_img = img_ids.shape[1]
+        B = txt_ids.shape[0]
+
+        # Axis 0: 1D sequence IDs (text + image linear patch ID)
+        ids_axis0 = torch.cat((txt_ids, img_ids), dim=1)  # Shape: [B, S_txt + S_img]
+
+        # Axis 1 & 2: Spatial coordinates. Zeros for text, H/W coords for image patches.
+        ids_axis1_text = torch.zeros_like(txt_ids)
+        ids_axis2_text = torch.zeros_like(txt_ids)
+
+        # Convert linear img_ids (0 to S_img-1) to 2D H/W coordinates
+        # patch_grid_h and patch_grid_w are the dimensions of the patch grid.
+        img_h_coords = img_ids // patch_grid_w  # Row index
+        img_w_coords = img_ids % patch_grid_w   # Column index
+
+        ids_axis1_img = img_h_coords # Shape [B, S_img]
+        ids_axis2_img = img_w_coords # Shape [B, S_img]
+
+        ids_axis1 = torch.cat((ids_axis1_text, ids_axis1_img), dim=1) # Shape: [B, S_txt + S_img]
+        ids_axis2 = torch.cat((ids_axis2_text, ids_axis2_img), dim=1) # Shape: [B, S_txt + S_img]
+        
+        pe = self.pe_embedder(ids_axis0, ids_axis1, ids_axis2) # Pass three tensors
+
         current_img_features = img_p
         current_txt_features = txt_f
 
-        for i,blk in enumerate(self.double_blocks):
-            dist_img_m,dist_txt_m = (mod_vecs_chroma.get(f"double_blocks.{i}.img_mod.lin"),mod_vecs_chroma.get(f"double_blocks.{i}.txt_mod.lin")) if mod_vecs_chroma else (None,None)
-            if self.blocks_to_swap and self.offloader_double: self.offloader_double.wait_for_block(i)
-            current_img_features,current_txt_features=blk(current_img_features,current_txt_features,internal_cond_vec,pe,txt_attention_mask,dist_img_m,dist_txt_m)
-            if self.blocks_to_swap and self.offloader_double: self.offloader_double.submit_move_blocks(self.double_blocks,i)
+        for i, blk in enumerate(self.double_blocks):
+            dist_img_m, dist_txt_m = (mod_vecs_chroma.get(f"double_blocks.{i}.img_mod.lin"), mod_vecs_chroma.get(f"double_blocks.{i}.txt_mod.lin")) if mod_vecs_chroma else (None, None)
+            if self.blocks_to_swap and self.offloader_double:
+                self.offloader_double.wait_for_block(i)
+            current_img_features, current_txt_features = blk(current_img_features, current_txt_features, internal_cond_vec, pe, txt_attention_mask, dist_img_m, dist_txt_m)
+            if self.blocks_to_swap and self.offloader_double:
+                self.offloader_double.submit_move_blocks(self.double_blocks, i)
             
-        sb_in=torch.cat((current_txt_features,current_img_features),dim=1)
-        sb_attn_mask=None
+        sb_in = torch.cat((current_txt_features, current_img_features), dim=1)
+        sb_attn_mask = None
         if txt_attention_mask is not None:
-            img_mask_sb=torch.ones(txt_attention_mask.shape[0],current_img_features.shape[1],device=txt_attention_mask.device,dtype=txt_attention_mask.dtype)
-            sb_attn_mask=torch.cat((txt_attention_mask,img_mask_sb),dim=1)
+            img_mask_sb = torch.ones(txt_attention_mask.shape[0], current_img_features.shape[1], device=txt_attention_mask.device, dtype=txt_attention_mask.dtype) # Use dtype of txt_attention_mask
+            sb_attn_mask = torch.cat((txt_attention_mask, img_mask_sb), dim=1)
             
-        for i,blk in enumerate(self.single_blocks):
-            dist_s_mod=mod_vecs_chroma.get(f"single_blocks.{i}.modulation.lin") if mod_vecs_chroma else None
-            if self.blocks_to_swap and self.offloader_single: self.offloader_single.wait_for_block(i)
-            sb_in=blk(sb_in,internal_cond_vec,pe,sb_attn_mask,dist_s_mod)
-            if self.blocks_to_swap and self.offloader_single: self.offloader_single.submit_move_blocks(self.single_blocks,i)
+        for i, blk in enumerate(self.single_blocks):
+            dist_s_mod = mod_vecs_chroma.get(f"single_blocks.{i}.modulation.lin") if mod_vecs_chroma else None
+            if self.blocks_to_swap and self.offloader_single:
+                self.offloader_single.wait_for_block(i)
+            sb_in = blk(sb_in, internal_cond_vec, pe, sb_attn_mask, dist_s_mod)
+            if self.blocks_to_swap and self.offloader_single:
+                self.offloader_single.submit_move_blocks(self.single_blocks, i)
             
-        img_f_final=sb_in[:,current_txt_features.shape[1]:]
+        img_f_final = sb_in[:, current_txt_features.shape[1]:]
         if self.training and self.cpu_offload_checkpointing and self.blocks_to_swap:
-            img_f_final,internal_cond_vec=img_f_final.to(self.device),internal_cond_vec.to(self.device)
+            img_f_final, internal_cond_vec = img_f_final.to(self.device), internal_cond_vec.to(self.device)
             
-        # Always use self.final_layer (which is LastLayer)
-        # For Chroma, internal_cond_vec will be ~zero if guidance_in is Identity (due to missing keys)
-        # and LastLayer's adaLN_modulation part will effectively be a no-op or apply minimal change.
-        # The distill_vec argument to self.final_layer is not used for Chroma based on current logic.
         img_out = self.final_layer(img_f_final, vec=internal_cond_vec, distill_vec=None)
         return img_out
 

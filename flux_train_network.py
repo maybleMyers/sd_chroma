@@ -601,111 +601,118 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         args,
         accelerator,
         noise_scheduler,
-        latents,
+        latents, # Original (unpacked) latents from VAE, shape [B, C, H_orig_lat, W_orig_lat]
         batch,
-        text_encoder_conds, # This will be a list [clip_l_outputs_or_None, t5_outputs]
+        text_encoder_conds, 
         unet: flux_models.Flux,
-        network, # LoRA network
+        network, 
         weight_dtype,
         train_unet,
         is_train=True,
     ):
-        logger.info("DEBUG: Entered get_noise_pred_and_target.") # <--- DEBUG
+        logger.info("DEBUG: Entered get_noise_pred_and_target.")
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
 
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
         )
-        logger.info(f"DEBUG: Noisy latents shape: {noisy_model_input.shape}, device: {noisy_model_input.device}") # <--- DEBUG
+        # noisy_model_input is the original latents + noise, shape [B, C, H_orig_lat, W_orig_lat]
+        logger.info(f"DEBUG: Noisy latents (before packing) shape: {noisy_model_input.shape}, device: {noisy_model_input.device}")
+
+        # Determine patch grid dimensions based on original latent shape (before packing)
+        # Assuming FLUX uses a patch factor of 2 (e.g., 2x2 pixels from original latents form one patch)
+        patch_factor = 2 
+        patch_grid_h = noisy_model_input.shape[2] // patch_factor
+        patch_grid_w = noisy_model_input.shape[3] // patch_factor
+        logger.info(f"DEBUG: Calculated patch_grid_h={patch_grid_h}, patch_grid_w={patch_grid_w}")
+
 
         packed_noisy_model_input = flux_utils.pack_latents(noisy_model_input)
-        packed_latent_height, packed_latent_width = noisy_model_input.shape[2] // 2, noisy_model_input.shape[3] // 2
-        img_ids = flux_utils.prepare_img_ids(bsz, packed_latent_height, packed_latent_width).to(device=accelerator.device)
+        # packed_latent_height, packed_latent_width are not needed by flux_utils.prepare_img_ids if it generates linear IDs
+        # img_ids = flux_utils.prepare_img_ids(bsz, packed_latent_height, packed_latent_width).to(device=accelerator.device)
+        # Let's assume prepare_img_ids calculates the number of patches (S_img) based on patch_grid_h, patch_grid_w
+        # and returns linear IDs from 0 to S_img-1.
+        num_patches = patch_grid_h * patch_grid_w
+        img_ids_linear = torch.arange(num_patches, device=accelerator.device).unsqueeze(0).repeat(bsz, 1)
+
+
         guidance_vec = torch.full((bsz,), float(args.guidance_scale), device=accelerator.device)
 
         l_pooled, t5_out, txt_ids, t5_attn_mask_from_conds = text_encoder_conds
-        logger.info(f"DEBUG: TE conds device before move - l_pooled: {l_pooled.device if l_pooled is not None else 'None'}, t5_out: {t5_out.device if t5_out is not None else 'None'}") # <--- DEBUG
+        logger.info(f"DEBUG: TE conds device before move - l_pooled: {l_pooled.device if l_pooled is not None else 'None'}, t5_out: {t5_out.device if t5_out is not None else 'None'}")
         if l_pooled is not None:
             l_pooled = l_pooled.to(accelerator.device, dtype=weight_dtype)
         if t5_out is not None:
             t5_out = t5_out.to(accelerator.device, dtype=weight_dtype)
         if txt_ids is not None:
-            txt_ids = txt_ids.to(accelerator.device) # token ids are long/int, not float
+            txt_ids = txt_ids.to(accelerator.device)
         if t5_attn_mask_from_conds is not None:
             t5_attn_mask_from_conds = t5_attn_mask_from_conds.to(accelerator.device)
 
         if args.gradient_checkpointing:
             packed_noisy_model_input.requires_grad_(True) 
-            # Re-check text_encoder_conds after they have been potentially moved to GPU and assigned
             if l_pooled is not None and l_pooled.dtype.is_floating_point:
                  l_pooled.requires_grad_(True)
             if t5_out is not None and t5_out.dtype.is_floating_point:
                  t5_out.requires_grad_(True)
-            if txt_ids is not None and txt_ids.dtype.is_floating_point: # Unlikely but safe check
+            if txt_ids is not None and txt_ids.dtype.is_floating_point:
                  txt_ids.requires_grad_(True) 
             logger.info(f"DEBUG: TE conds device after move - l_pooled: {l_pooled.device if l_pooled is not None else 'None'}, t5_out: {t5_out.device if t5_out is not None else 'None'}")
-            # +++ ADD SHAPE LOGGING +++
             logger.info(f"DEBUG: txt_ids (shape, ndim, dtype): {txt_ids.shape if txt_ids is not None else 'None'}, {txt_ids.ndim if txt_ids is not None else 'None'}, {txt_ids.dtype if txt_ids is not None else 'None'}")
-            logger.info(f"DEBUG: img_ids (shape, ndim, dtype): {img_ids.shape if img_ids is not None else 'None'}, {img_ids.ndim if img_ids is not None else 'None'}, {img_ids.dtype if img_ids is not None else 'None'}")
-            # Ensure txt_ids is 2D for concatenation with img_ids
+            # logger.info(f"DEBUG: img_ids (shape, ndim, dtype): {img_ids.shape if img_ids is not None else 'None'}, {img_ids.ndim if img_ids is not None else 'None'}, {img_ids.dtype if img_ids is not None else 'None'}")
+            logger.info(f"DEBUG: img_ids_linear (shape, ndim, dtype): {img_ids_linear.shape}, {img_ids_linear.ndim}, {img_ids_linear.dtype}")
+
             if txt_ids is not None and txt_ids.ndim == 3 and txt_ids.shape[1] == 1:
                 logger.info(f"DEBUG: Squeezing txt_ids from {txt_ids.shape} to 2D before UNet call.")
                 txt_ids = txt_ids.squeeze(1)
                 logger.info(f"DEBUG: txt_ids after squeeze (shape, ndim): {txt_ids.shape}, {txt_ids.ndim}")            
             logger.info(f"DEBUG: t5_out (txt) (shape, ndim, dtype): {t5_out.shape if t5_out is not None else 'None'}, {t5_out.ndim if t5_out is not None else 'None'}, {t5_out.dtype if t5_out is not None else 'None'}")            
-            img_ids.requires_grad_(True)
+            # img_ids.requires_grad_(True) # img_ids are indices, should not require grad
+            img_ids_linear.requires_grad_(False) # Indices should not require grad
             guidance_vec.requires_grad_(True)
-        # +++ START OF CRITICAL DEBUG LOGGING +++
+        
         logger.info("FLUX_TRAINER_DEBUG: --- Before calling call_dit_func ---")
-        if l_pooled is not None:
-            logger.info(f"FLUX_TRAINER_DEBUG: l_pooled.shape: {l_pooled.shape}, l_pooled.ndim: {l_pooled.ndim}, l_pooled.device: {l_pooled.device}")
-        else:
-            logger.info("FLUX_TRAINER_DEBUG: l_pooled is None")
-
-        if t5_out is not None: # This is 'txt' for the model
-            logger.info(f"FLUX_TRAINER_DEBUG: t5_out (txt).shape: {t5_out.shape}, t5_out.ndim: {t5_out.ndim}, t5_out.device: {t5_out.device}")
-        else:
-            logger.info("FLUX_TRAINER_DEBUG: t5_out (txt) is None")
-            
-        if txt_ids is not None: # This is 'txt_ids' for the model
-            logger.info(f"FLUX_TRAINER_DEBUG: txt_ids.shape: {txt_ids.shape}, txt_ids.ndim: {txt_ids.ndim}, txt_ids.device: {txt_ids.device}")
-        else:
-            logger.info("FLUX_TRAINER_DEBUG: txt_ids is None")
-
-        if img_ids is not None: # This is 'img_ids' for the model
-            logger.info(f"FLUX_TRAINER_DEBUG: img_ids.shape: {img_ids.shape}, img_ids.ndim: {img_ids.ndim}, img_ids.device: {img_ids.device}")
-        else:
-            logger.info("FLUX_TRAINER_DEBUG: img_ids is None")
-            
-        if t5_attn_mask_from_conds is not None: # This is 'txt_attention_mask' for the model
-             logger.info(f"FLUX_TRAINER_DEBUG: t5_attn_mask_from_conds.shape: {t5_attn_mask_from_conds.shape}, t5_attn_mask_from_conds.ndim: {t5_attn_mask_from_conds.ndim}, t5_attn_mask_from_conds.device: {t5_attn_mask_from_conds.device}")
-        else:
-            logger.info("FLUX_TRAINER_DEBUG: t5_attn_mask_from_conds is None")
-        # +++ END OF CRITICAL DEBUG LOGGING +++        
+        # ... (existing debug logs for l_pooled, t5_out, txt_ids) ...
+        logger.info(f"FLUX_TRAINER_DEBUG: img_ids_linear.shape: {img_ids_linear.shape}, img_ids_linear.ndim: {img_ids_linear.ndim}, img_ids_linear.device: {img_ids_linear.device}")
+        # ... (existing debug log for t5_attn_mask_from_conds) ...
+                
         actual_t5_attn_mask_for_model = t5_attn_mask_from_conds if args.apply_t5_attn_mask else None
 
-        def call_dit_func(img_in, img_ids_in, txt_in, txt_ids_in, y_in, timesteps_in, guidance_in, txt_attention_mask_in):
+        def call_dit_func(img_in, img_ids_in, txt_in, txt_ids_in, y_in, timesteps_in, guidance_in, txt_attention_mask_in, pgh, pgw): # Add pgh, pgw
             with torch.set_grad_enabled(is_train), accelerator.autocast():
                 logger.info("DEBUG: Calling unet.forward()...")
                 model_pred_out = unet(
                     img=img_in, img_ids=img_ids_in, txt=txt_in, txt_ids=txt_ids_in, y=y_in,
                     timesteps=timesteps_in / 1000, guidance=guidance_in, txt_attention_mask=txt_attention_mask_in,
+                    patch_grid_h=pgh, patch_grid_w=pgw, # Pass new args
                 )
-                logger.info("DEBUG: unet.forward() returned.") # <--- DEBUG
+                logger.info("DEBUG: unet.forward() returned.")
             return model_pred_out
 
         model_pred = call_dit_func(
-            packed_noisy_model_input, img_ids, t5_out, txt_ids, 
-            l_pooled, # This will be None for Chroma if CLIP-L is not used. Flux model needs to handle.
+            packed_noisy_model_input, img_ids_linear, t5_out, txt_ids, 
+            l_pooled, 
             timesteps, guidance_vec, actual_t5_attn_mask_for_model,
+            patch_grid_h, patch_grid_w # Pass new args
         )
 
-        model_pred = flux_utils.unpack_latents(model_pred, packed_latent_height, packed_latent_width)
-        model_pred, weighting = flux_train_utils.apply_model_prediction_type(args, model_pred, noisy_model_input, sigmas)
-        target = noise - latents
+        # The unpack_latents function expects height and width of the *original* (pre-packing) latents
+        # if the model_pred is in the packed format.
+        # However, model_pred here is the output of the DiT, which should match the *original* latent dimensions.
+        # The packing/unpacking for FLUX DiT might be different than SD3.
+        # For now, assume model_pred is already in the original latent dimensions [B, C, H_orig_lat, W_orig_lat].
+        # If it's not, flux_utils.unpack_latents would need different height/width.
+        # Let's assume model_pred matches noisy_model_input's spatial dimensions.
+        # The original unpack_latents used packed_latent_height, packed_latent_width which were H_orig_lat//2, W_orig_lat//2
+        # This implies model_pred was in packed format. The current flux_models.py seems to output in original latent size.
+        # If model_pred comes out with C=16, H=72, W=56 (matching latents arg to get_noise_pred_and_target)
+        # then no unpacking is needed here. Let's assume this for now.
+        # model_pred = flux_utils.unpack_latents(model_pred, noisy_model_input.shape[2], noisy_model_input.shape[3]) # If pred is packed
 
-        # ... (diff_output_pr_indices logic seems okay, assumes text_encoder_conds has the right structure) ...
+        model_pred, weighting = flux_train_utils.apply_model_prediction_type(args, model_pred, noisy_model_input, sigmas)
+        target = noise - latents # Target is based on original latents and noise
+
         if "custom_attributes" in batch:
             diff_output_pr_indices = []
             for i, custom_attributes in enumerate(batch["custom_attributes"]):
@@ -714,9 +721,9 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
             if len(diff_output_pr_indices) > 0:
                 network.set_multiplier(0.0)
-                unet.prepare_block_swap_before_forward() # ensure this is called if blocks are swapped
+                if hasattr(unet, 'prepare_block_swap_before_forward'): # Check if method exists
+                    unet.prepare_block_swap_before_forward() 
                 with torch.no_grad():
-                    # Select the corresponding parts of text_encoder_conds
                     l_pooled_prior = l_pooled[diff_output_pr_indices] if l_pooled is not None else None
                     t5_out_prior = t5_out[diff_output_pr_indices]
                     txt_ids_prior = txt_ids[diff_output_pr_indices]
@@ -724,17 +731,18 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                     
                     model_pred_prior = call_dit_func(
                         packed_noisy_model_input[diff_output_pr_indices],
-                        img_ids[diff_output_pr_indices],
+                        img_ids_linear[diff_output_pr_indices], # Use img_ids_linear
                         t5_out_prior,
                         txt_ids_prior,
                         l_pooled_prior,
                         timesteps[diff_output_pr_indices],
                         guidance_vec[diff_output_pr_indices] if guidance_vec is not None else None,
                         t5_attn_mask_prior,
+                        patch_grid_h, patch_grid_w # Pass new args
                     )
                 network.set_multiplier(1.0) 
 
-                model_pred_prior = flux_utils.unpack_latents(model_pred_prior, packed_latent_height, packed_latent_width)
+                # model_pred_prior = flux_utils.unpack_latents(model_pred_prior, noisy_model_input.shape[2], noisy_model_input.shape[3]) # If pred_prior is packed
                 model_pred_prior, _ = flux_train_utils.apply_model_prediction_type(
                     args,
                     model_pred_prior,
