@@ -405,8 +405,9 @@ class NetworkTrainer:
                     accelerator.print("NaN found in latents, replacing with zeros")
                     latents = typing.cast(torch.FloatTensor, torch.nan_to_num(latents, 0, out=latents))
             latents = self.shift_scale_latents(args, latents)
-
+        logger.info("DEBUG: Entered process_batch.")
         text_encoder_conds = batch.get("text_encoder_outputs_list")
+        logger.info(f"DEBUG: batch['text_encoder_outputs_list'] is {'present' if text_encoder_conds is not None else 'missing'}.")
 
         needs_on_the_fly_encoding = False
         if train_text_encoder:
@@ -414,11 +415,12 @@ class NetworkTrainer:
         else:
             if text_encoder_conds is None: 
                 needs_on_the_fly_encoding = True
-        
+        logger.info(f"DEBUG: needs_on_the_fly_encoding: {needs_on_the_fly_encoding}")
         if text_encoder_conds is None:
             text_encoder_conds = [] 
 
         if needs_on_the_fly_encoding:
+            logger.info("DEBUG: Entering on-the-fly encoding block.")
             input_ids_list_from_batch = batch.get("input_ids_list")
             if input_ids_list_from_batch is None and ("captions" not in batch or batch["captions"] is None):
                 accelerator.print(
@@ -455,9 +457,12 @@ class NetworkTrainer:
                     if input_ids_list_from_batch is not None:
                         input_ids_for_encoding_source = [ids.to(accelerator.device) for ids in input_ids_list_from_batch]
                     elif "captions" in batch and batch["captions"] is not None:
+                        logger.info("DEBUG: Tokenizing captions on-the-fly...")
                         input_ids_for_encoding_source = tokenize_strategy.tokenize(batch["captions"])
+                        logger.info("DEBUG: Tokenizing complete.")
                     else:
                         raise ValueError("Cannot encode: No 'input_ids_list' or 'captions' in batch.")
+                    logger.info("DEBUG: Encoding tokens...")
 
                     encoded_text_encoder_conds_new = text_encoding_strategy.encode_tokens(
                         tokenize_strategy,
@@ -465,6 +470,7 @@ class NetworkTrainer:
                         input_ids_for_encoding_source, 
                         **encode_kwargs # Pass kwargs here
                     )
+                    logger.info("DEBUG: Encoding complete.")
 
                 if args.full_fp16: 
                     encoded_text_encoder_conds_new = [
@@ -497,7 +503,7 @@ class NetworkTrainer:
              logger.warning(f"text_encoder_conds is None before calling get_noise_pred_and_target. Defaulting to list of {num_expected_te_outputs} Nones.")
              text_encoder_conds = [None] * num_expected_te_outputs
 
-
+        logger.info("DEBUG: Calling get_noise_pred_and_target...")
         noise_pred, target, timesteps, weighting = self.get_noise_pred_and_target(
             args,
             accelerator,
@@ -511,6 +517,7 @@ class NetworkTrainer:
             train_unet,
             is_train=is_train,
         )
+        logger.info("DEBUG: Returned from get_noise_pred_and_target.")
         
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
         loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
@@ -843,9 +850,17 @@ class NetworkTrainer:
         # prepare dataloader
         # strategies are set here because they cannot be referenced in another process. Copy them with the dataset
         # some strategies can be None
+        logger.info("DEBUG: Setting current strategies on train_dataset_group BEFORE DataLoader creation.") # DEBUG
         train_dataset_group.set_current_strategies()
         if val_dataset_group is not None:
             val_dataset_group.set_current_strategies()
+        # Log the strategy instances on the dataset group
+        if hasattr(train_dataset_group, 'datasets') and train_dataset_group.datasets:
+            first_ds = train_dataset_group.datasets[0]
+            logger.info(f"DEBUG: train_dataset_group.datasets[0].tokenize_strategy: {type(first_ds.tokenize_strategy)}") # DEBUG
+            logger.info(f"DEBUG: train_dataset_group.datasets[0].text_encoder_output_caching_strategy: {type(first_ds.text_encoder_output_caching_strategy)}") # DEBUG
+            if first_ds.text_encoder_output_caching_strategy:
+                logger.info(f"DEBUG: ...caching_strategy.apply_t5_attn_mask: {first_ds.text_encoder_output_caching_strategy.apply_t5_attn_mask}") # DEBUG
 
         # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
         n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers

@@ -1,3 +1,6 @@
+# flux_train_network.py
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import copy
 import math
@@ -353,12 +356,14 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         train_unet,
         is_train=True,
     ):
+        logger.info("DEBUG: Entered get_noise_pred_and_target.") # <--- DEBUG
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
 
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
         )
+        logger.info(f"DEBUG: Noisy latents shape: {noisy_model_input.shape}, device: {noisy_model_input.device}") # <--- DEBUG
 
         packed_noisy_model_input = flux_utils.pack_latents(noisy_model_input)
         packed_latent_height, packed_latent_width = noisy_model_input.shape[2] // 2, noisy_model_input.shape[3] // 2
@@ -379,19 +384,39 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             guidance_vec.requires_grad_(True)
 
         l_pooled, t5_out, txt_ids, t5_attn_mask_from_conds = text_encoder_conds
-        
-        # For Chroma, l_pooled (from CLIP-L) will be None if CLIP-L is not used.
-        # The Flux model's forward pass needs to handle this.
-        # txt_ids are from T5, t5_out is from T5.
+        logger.info(f"DEBUG: TE conds device before move - l_pooled: {l_pooled.device if l_pooled is not None else 'None'}, t5_out: {t5_out.device if t5_out is not None else 'None'}") # <--- DEBUG
+        if l_pooled is not None:
+            l_pooled = l_pooled.to(accelerator.device, dtype=weight_dtype)
+        if t5_out is not None:
+            t5_out = t5_out.to(accelerator.device, dtype=weight_dtype)
+        if txt_ids is not None:
+            txt_ids = txt_ids.to(accelerator.device) # token ids are long/int, not float
+        if t5_attn_mask_from_conds is not None:
+            t5_attn_mask_from_conds = t5_attn_mask_from_conds.to(accelerator.device)
 
+        if args.gradient_checkpointing:
+            packed_noisy_model_input.requires_grad_(True) 
+            # Re-check text_encoder_conds after they have been potentially moved to GPU and assigned
+            if l_pooled is not None and l_pooled.dtype.is_floating_point:
+                 l_pooled.requires_grad_(True)
+            if t5_out is not None and t5_out.dtype.is_floating_point:
+                 t5_out.requires_grad_(True)
+            if txt_ids is not None and txt_ids.dtype.is_floating_point: # Unlikely but safe check
+                 txt_ids.requires_grad_(True) 
+            logger.info(f"DEBUG: TE conds device after move - l_pooled: {l_pooled.device if l_pooled is not None else 'None'}, t5_out: {t5_out.device if t5_out is not None else 'None'}")
+            img_ids.requires_grad_(True)
+            guidance_vec.requires_grad_(True)
+        
         actual_t5_attn_mask_for_model = t5_attn_mask_from_conds if args.apply_t5_attn_mask else None
 
         def call_dit_func(img_in, img_ids_in, txt_in, txt_ids_in, y_in, timesteps_in, guidance_in, txt_attention_mask_in):
             with torch.set_grad_enabled(is_train), accelerator.autocast():
+                logger.info("DEBUG: Calling unet.forward()...")
                 model_pred_out = unet(
                     img=img_in, img_ids=img_ids_in, txt=txt_in, txt_ids=txt_ids_in, y=y_in,
                     timesteps=timesteps_in / 1000, guidance=guidance_in, txt_attention_mask=txt_attention_mask_in,
                 )
+                logger.info("DEBUG: unet.forward() returned.") # <--- DEBUG
             return model_pred_out
 
         model_pred = call_dit_func(

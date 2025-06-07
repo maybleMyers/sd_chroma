@@ -2338,6 +2338,8 @@ class FineTuningDataset(BaseDataset):
         return None, None # No old-style npz found based on image_key
 
     def __getitem__(self, index):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else "main"
         # This __getitem__ is inherited from BaseDataset.
         # The crucial part for the current error is how example["text_encoder_outputs_list"]
         # and example["input_ids_list"] are populated within BaseDataset.__getitem__.
@@ -2354,6 +2356,8 @@ class FineTuningDataset(BaseDataset):
         bucket = self.bucket_manager.buckets[self.buckets_indices[index].bucket_index]
         bucket_batch_size = self.buckets_indices[index].bucket_batch_size
         image_index_in_bucket = self.buckets_indices[index].batch_index * bucket_batch_size
+        logger.info(f"DEBUG_WORKER_{worker_id}: __getitem__ for batch index {index}, first image_key: {bucket[image_index_in_bucket] if bucket_batch_size > 0 else 'N/A'}") # DEBUG
+
 
         # Prepare lists for batch items
         loss_weights = []
@@ -2502,24 +2506,58 @@ class FineTuningDataset(BaseDataset):
             current_item_input_ids_data = None # This will be List[Optional[Tensor]] or Dict
 
             tokenization_required_for_item = True # Default
-            if self.text_encoder_output_caching_strategy: # Check if strategy exists
-                if image_info.text_encoder_outputs is not None: # In-memory python object cache
-                    current_item_te_outputs = image_info.text_encoder_outputs
+            logger.info(f"DEBUG_WORKER_{worker_id}: Processing image_key: {image_info.image_key}, abs_path: {image_info.absolute_path}") # DEBUG
+
+            if self.text_encoder_output_caching_strategy:
+                if image_info.text_encoder_outputs is not None:
+                    logger.info(f"DEBUG_WORKER_{worker_id}: [{image_key}] Using IN-MEMORY TE cache.") # DEBUG
+                    text_encoder_outputs_for_item = image_info.text_encoder_outputs
                     tokenization_required_for_item = False
-                elif image_info.text_encoder_outputs_npz is not None: # Path to disk cache
-                    if self.text_encoder_output_caching_strategy.is_disk_cached_outputs_expected(image_info.text_encoder_outputs_npz):
-                        current_item_te_outputs = self.text_encoder_output_caching_strategy.load_outputs_npz(image_info.text_encoder_outputs_npz)
-                        tokenization_required_for_item = False
+                elif image_info.text_encoder_outputs_npz is not None:
+                    logger.info(f"DEBUG_WORKER_{worker_id}: [{image_key}] NPZ path from ImageInfo: {image_info.text_encoder_outputs_npz}") # DEBUG
+                    if not os.path.exists(image_info.text_encoder_outputs_npz):
+                        logger.error(f"DEBUG_WORKER_{worker_id}: [{image_key}] NPZ FILE DOES NOT EXIST: {image_info.text_encoder_outputs_npz}") # DEBUG
+                    
+                    cache_is_expected = self.text_encoder_output_caching_strategy.is_disk_cached_outputs_expected(image_info.text_encoder_outputs_npz)
+                    logger.info(f"DEBUG_WORKER_{worker_id}: [{image_key}] is_disk_cached_outputs_expected for '{image_info.text_encoder_outputs_npz}': {cache_is_expected}") # DEBUG
+                    
+                    if cache_is_expected:
+                        try:
+                            logger.info(f"DEBUG_WORKER_{worker_id}: [{image_key}] Loading from NPZ: {image_info.text_encoder_outputs_npz}") # DEBUG
+                            text_encoder_outputs_for_item = self.text_encoder_output_caching_strategy.load_outputs_npz(
+                                image_info.text_encoder_outputs_npz
+                            )
+                            logger.info(f"DEBUG_WORKER_{worker_id}: [{image_key}] Loaded from NPZ successfully. Type: {type(text_encoder_outputs_for_item)}. Is list: {isinstance(text_encoder_outputs_for_item, list)}. Length if list: {len(text_encoder_outputs_for_item) if isinstance(text_encoder_outputs_for_item, list) else 'N/A'}") # DEBUG
+                            # Check if T5 component (index 1) is not None
+                            if text_encoder_outputs_for_item is not None and isinstance(text_encoder_outputs_for_item, list) and len(text_encoder_outputs_for_item) > 1 and text_encoder_outputs_for_item[1] is not None:
+                                tokenization_required_for_item = False
+                            else:
+                                logger.warning(f"DEBUG_WORKER_{worker_id}: [{image_key}] Loaded NPZ but content seems invalid (e.g., T5 part missing or not a list). Forcing re-tokenization.")
+                                text_encoder_outputs_for_item = None 
+                        except Exception as e:
+                            logger.error(f"DEBUG_WORKER_{worker_id}: [{image_key}] Error loading NPZ '{image_info.text_encoder_outputs_npz}': {e}. Forcing re-tokenization.")
+                            text_encoder_outputs_for_item = None 
+                    else:
+                        logger.info(f"DEBUG_WORKER_{worker_id}: [{image_key}] Cache not expected for NPZ: {image_info.text_encoder_outputs_npz}. Forcing re-tokenization.")
+                else:
+                    logger.info(f"DEBUG_WORKER_{worker_id}: [{image_key}] No NPZ path in ImageInfo. Forcing re-tokenization.")
+            else:
+                logger.info(f"DEBUG_WORKER_{worker_id}: [{image_key}] No TE caching strategy. Forcing re-tokenization.")
+
+            text_encoder_outputs_list_per_item_in_batch.append(text_encoder_outputs_for_item)
             
+            current_item_input_ids_data = None # Placeholder
             if tokenization_required_for_item:
-                caption_for_item = self.process_caption(subset, image_info.caption)
-                # tokenize_strategy.tokenize() for Flux returns a dict: {"clip_l": {"input_ids":...}, "t5xxl": ...}
-                # for SD, it returns a list of tensors: [clip_tokens_tensor]
-                token_data_from_strategy = self.tokenize_strategy.tokenize(caption_for_item)
-                current_item_input_ids_data = token_data_from_strategy 
-            
-            text_encoder_outputs_list_per_item_in_batch.append(current_item_te_outputs)
-            input_ids_list_per_item_in_batch.append(current_item_input_ids_data)
+                logger.info(f"DEBUG: [{image_key}] Tokenization REQUIRED.") # DEBUG
+                caption = self.process_caption(subset, image_info.caption) # caption already defined, re-assign potentially processed
+                # This tokenize call is what leads to the hang if TOKENIZERS_PARALLELISM is not false
+                current_item_input_ids_data = self.tokenize_strategy.tokenize(caption)
+            else:
+                logger.info(f"DEBUG: [{image_key}] Tokenization SKIPPED (cache hit).") # DEBUG
+
+            input_ids_list_per_item_in_batch.append(current_item_input_ids_data) # Will be None if cache hit
+            captions.append(caption)
+
             captions_for_batch.append(caption_for_item)
 
         # --- Batch Assembly ---
