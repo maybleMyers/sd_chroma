@@ -499,8 +499,24 @@ class LatentsCachingStrategy:
             original_size = original_sizes[i]
             crop_ltrb = crop_ltrbs[i]
 
-            latents_size = latents.shape[1:3]  # H, W
-            key_reso_suffix = f"_{latents_size[0]}x{latents_size[1]}" if multi_resolution else ""  # e.g. "_32x64", HxW
+            key_reso_suffix = ""
+            if multi_resolution:
+                # For multi-resolution, key suffix is based on latents' HxW derived from bucket_reso.
+                # This ensures consistency with how it's calculated during load.
+                current_strategy = LatentsCachingStrategy.get_strategy() # Get the currently active strategy
+                
+                # Determine stride, specific to strategy
+                stride = 8 # Default stride if not specialized
+                if hasattr(current_strategy, 'FLUX_VAE_DOWNSCALE_FACTOR'): # Flux specific
+                    stride = current_strategy.FLUX_VAE_DOWNSCALE_FACTOR
+                elif hasattr(current_strategy, 'SD_VAE_DOWNSCALE_FACTOR'): # SDXL specific (though less likely for multi_resolution=True here)
+                    stride = current_strategy.SD_VAE_DOWNSCALE_FACTOR
+                
+                # info.bucket_reso is (Width, Height)
+                latents_expected_h = info.bucket_reso[1] // stride 
+                latents_expected_w = info.bucket_reso[0] // stride
+                
+                key_reso_suffix = f"_{latents_expected_h}x{latents_expected_w}" # e.g. "_36x28" for HxW
 
             if self.cache_to_disk:
                 self.save_latents_to_disk(
