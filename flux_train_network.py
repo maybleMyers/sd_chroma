@@ -42,6 +42,39 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.train_clip_l: bool = False  # Initialize here
         self.train_t5xxl: bool = False # Initialize here
 
+    def all_reduce_network(self, accelerator: Accelerator, network: torch.nn.Module):
+        """
+        Manually reduces gradients for the network parameters across DDP processes.
+        This is called when accelerator.sync_gradients is True.
+        Often, accelerator.backward() handles this implicitly, but an explicit
+        call might be needed for specific network types or DDP configurations.
+        """
+        if accelerator.state.num_processes > 1:
+            # Check if the network has parameters that require gradients.
+            # The `network` object here is the LoRA network.
+            # We are interested in the gradients of its trainable parameters.
+            trainable_params = [p for p in network.parameters() if p.requires_grad and p.grad is not None]
+            
+            if not trainable_params:
+                logger.debug("all_reduce_network: No trainable parameters with gradients found in the network to reduce.")
+                return
+
+            logger.debug(f"all_reduce_network: Attempting to reduce gradients for {len(trainable_params)} parameter(s)/tensor(s) in the network.")
+            
+            # It's generally safer to reduce gradients one by one if they are not part of a single contiguous block
+            # that `accelerator.backward` would handle perfectly for a simple model.
+            # For LoRA, parameters are typically distinct.
+            for param in trainable_params:
+                try:
+                    # The reduction operation should be 'mean' for gradients.
+                    param.grad = accelerator.reduce(param.grad, reduction="mean")
+                except Exception as e:
+                    logger.error(f"Error during gradient reduction for a parameter: {e}")
+                    # Optionally, re-raise or handle as appropriate
+            logger.info(f"Manually reduced network gradients across DDP processes (num_processes: {accelerator.state.num_processes}).")
+        else:
+            logger.debug("all_reduce_network: Single process, no DDP reduction needed for the network.")
+            
     def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True):
         """
         Called at the start of each training step. Implements basic logging and ensures compatibility
