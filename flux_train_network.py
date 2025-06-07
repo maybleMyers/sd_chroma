@@ -162,27 +162,39 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         logger.debug("FluxNetworkTrainer: post_process_loss returning loss as is (or after parent's if flags were set).")
         return loss # Or return super().post_process_loss(loss, args, timesteps, noise_scheduler) if we want to keep parent's logic
-
+    
     def get_sai_model_spec(self, args: argparse.Namespace) -> dict:
-        # FLUX model has its own SAI model spec
-        # Use flux_utils.MODEL_TYPE_FLUX_DEV, flux_utils.MODEL_TYPE_FLUX_SCHNELL, or flux_utils.MODEL_TYPE_CHROMA
-        # self.model_type_str should be set
-        if self.model_type_str is None: # Fallback if not set, though it should be
+        # model_type_str should be set by load_target_model
+        if self.model_type_str is None:
              logger.warning("model_type_str not set in get_sai_model_spec, attempting to analyze checkpoint again.")
              if args.pretrained_model_name_or_path:
                 self.model_type_str, _, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
-             else: # Cannot determine type
+             else:
                  logger.error("Cannot determine FLUX model type for SAI metadata as pretrained_model_name_or_path is missing.")
-                 return train_util.get_sai_model_spec(None, args, is_sdxl=False, is_stable_diffusion_ckpt=True, flux="unknown_flux_type")
+                 # Fallback for the call, ensure all positional args are present
+                 return train_util.get_sai_model_spec(
+                     None,  # state_dict (or unet in other contexts)
+                     args,
+                     False, # sdxl
+                     True,  # lora (True because we are training LoRA)
+                     False, # textual_inversion
+                     is_stable_diffusion_ckpt=True, 
+                     sd3=None, # Assuming not SD3
+                     flux=MODEL_TYPE_UNKNOWN # Fallback flux type
+                 )
 
-
-        # Map internal model_type_str to the SAI flux argument string if necessary,
-        # or directly use a general one like flux_utils.MODEL_TYPE_FLUX_DEV for all trained LoRAs for now.
-        # For simplicity, let's use MODEL_TYPE_FLUX_DEV as a general tag for LoRAs trained on any FLUX variant.
-        # More specific tagging could be done if needed.
-        logger.info(f"FluxNetworkTrainer: Using flux='{flux_utils.MODEL_TYPE_FLUX_DEV}' for SAI metadata (original base: {self.model_type_str}).")
+        # For LoRA training, 'lora' should be True. 'textual_inversion' is False.
+        # 'sdxl' is False for FLUX.
+        logger.info(f"FluxNetworkTrainer: Using flux='{self.model_type_str}' for SAI metadata (original base: {self.model_type_str}). It's a LoRA.")
         return train_util.get_sai_model_spec(
-            None, args, is_sdxl=False, is_stable_diffusion_ckpt=True, flux=flux_utils.MODEL_TYPE_FLUX_DEV # Generic tag
+            None,  # state_dict (or unet in other contexts, pass None if not directly needed by this func for LoRA)
+            args,
+            False,                                  # sdxl (positional)
+            True,                                   # lora (positional - True because this is a LoRA trainer)
+            False,                                  # textual_inversion (positional)
+            is_stable_diffusion_ckpt=True,          # keyword
+            sd3=None,                               # keyword (assuming not SD3 for now)
+            flux=self.model_type_str                # keyword (use the analyzed model type)
         )
 
     def is_text_encoder_not_needed_for_training(self, args):
