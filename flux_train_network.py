@@ -661,6 +661,11 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             # +++ ADD SHAPE LOGGING +++
             logger.info(f"DEBUG: txt_ids (shape, ndim, dtype): {txt_ids.shape if txt_ids is not None else 'None'}, {txt_ids.ndim if txt_ids is not None else 'None'}, {txt_ids.dtype if txt_ids is not None else 'None'}")
             logger.info(f"DEBUG: img_ids (shape, ndim, dtype): {img_ids.shape if img_ids is not None else 'None'}, {img_ids.ndim if img_ids is not None else 'None'}, {img_ids.dtype if img_ids is not None else 'None'}")
+            # Ensure txt_ids is 2D for concatenation with img_ids
+            if txt_ids is not None and txt_ids.ndim == 3 and txt_ids.shape[1] == 1:
+                logger.info(f"DEBUG: Squeezing txt_ids from {txt_ids.shape} to 2D before UNet call.")
+                txt_ids = txt_ids.squeeze(1)
+                logger.info(f"DEBUG: txt_ids after squeeze (shape, ndim): {txt_ids.shape}, {txt_ids.ndim}")            
             logger.info(f"DEBUG: t5_out (txt) (shape, ndim, dtype): {t5_out.shape if t5_out is not None else 'None'}, {t5_out.ndim if t5_out is not None else 'None'}, {t5_out.dtype if t5_out is not None else 'None'}")            
             img_ids.requires_grad_(True)
             guidance_vec.requires_grad_(True)
