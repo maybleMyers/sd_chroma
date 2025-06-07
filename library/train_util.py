@@ -1171,8 +1171,7 @@ class BaseDataset(torch.utils.data.Dataset):
                 # check disk cache exists and size of latents
                 if caching_strategy.cache_to_disk:
                     # info.latents_npz = os.path.splitext(info.absolute_path)[0] + file_suffix
-                    info.latents_npz = caching_strategy.get_latents_npz_path(info.absolute_path, info.image_size)
-
+                    info.latents_npz = caching_strategy.get_latents_npz_path(info.absolute_path, info.bucket_reso)
                     # if the modulo of num_processes is not equal to process_index, skip caching
                     # this makes each process cache different latents
                     if i % num_processes != process_index:
@@ -2357,7 +2356,7 @@ class FineTuningDataset(BaseDataset):
                 if self.latents_caching_strategy:
                     # Pass image_info_obj.bucket_reso as the 'image_size' argument for path generation
                     image_info_obj.latents_npz = self.latents_caching_strategy.get_latents_npz_path(
-                        image_info_obj.absolute_path, image_info_obj.image_size # MUST be original image_size
+                        image_info_obj.absolute_path, image_info_obj.bucket_reso 
                     )
                 if self.text_encoder_output_caching_strategy:
                     image_info_obj.text_encoder_outputs_npz = self.text_encoder_output_caching_strategy.get_outputs_npz_path(
