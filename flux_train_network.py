@@ -7,7 +7,7 @@ import random
 from typing import Any, Optional, Union
 
 import torch
-torch.autograd.set_detect_anomaly(True)
+#torch.autograd.set_detect_anomaly(True)
 from accelerate import Accelerator
 from diffusers import DDPMScheduler # <--- ADD THIS IMPORT
 

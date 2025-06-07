@@ -731,6 +731,10 @@ class Flux(nn.Module):
             app_cfg=params.approximator_config
             if app_cfg.out_dim_per_mod_vector==0: app_cfg.out_dim_per_mod_vector=params.hidden_size
             self.modulation_approximator=Approximator(app_cfg.in_dim,app_cfg.out_dim_per_mod_vector,app_cfg.hidden_dim,app_cfg.n_layers)
+            # +++ TEMPORARY TEST +++
+            logger.warning("TEMPORARY TEST: Forcing modulation_approximator to None for Chroma NaN debug.")
+            self.modulation_approximator = None 
+            # +++ END TEMPORARY TEST +++
             self.register_buffer('mod_index',torch.arange(app_cfg.mod_index_length),persistent=False); self.mod_index_length=app_cfg.mod_index_length
         elif not params.use_modulation and not params.approximator_config: logger.warning("Flux configured use_modulation=False but no approximator_config.")
         
