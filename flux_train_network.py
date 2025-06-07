@@ -624,19 +624,6 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         img_ids = flux_utils.prepare_img_ids(bsz, packed_latent_height, packed_latent_width).to(device=accelerator.device)
         guidance_vec = torch.full((bsz,), float(args.guidance_scale), device=accelerator.device)
 
-        if args.gradient_checkpointing:
-            packed_noisy_model_input.requires_grad_(True) # Changed from noisy_model_input
-            if text_encoder_conds[0] is not None and text_encoder_conds[0].dtype.is_floating_point: # clip_l_pooled_output
-                 text_encoder_conds[0].requires_grad_(True)
-            if text_encoder_conds[1] is not None and text_encoder_conds[1].dtype.is_floating_point: # t5_output
-                 text_encoder_conds[1].requires_grad_(True)
-            if text_encoder_conds[2] is not None and text_encoder_conds[2].dtype.is_floating_point: # clip_l_hidden_states (txt_ids for flux)
-                 text_encoder_conds[2].requires_grad_(True) # txt_ids for flux are token ids, not floats usually
-            # t5_attn_mask (text_encoder_conds[3]) is usually bool or int, not float
-
-            img_ids.requires_grad_(True)
-            guidance_vec.requires_grad_(True)
-
         l_pooled, t5_out, txt_ids, t5_attn_mask_from_conds = text_encoder_conds
         logger.info(f"DEBUG: TE conds device before move - l_pooled: {l_pooled.device if l_pooled is not None else 'None'}, t5_out: {t5_out.device if t5_out is not None else 'None'}") # <--- DEBUG
         if l_pooled is not None:
@@ -669,7 +656,33 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             logger.info(f"DEBUG: t5_out (txt) (shape, ndim, dtype): {t5_out.shape if t5_out is not None else 'None'}, {t5_out.ndim if t5_out is not None else 'None'}, {t5_out.dtype if t5_out is not None else 'None'}")            
             img_ids.requires_grad_(True)
             guidance_vec.requires_grad_(True)
-        
+        # +++ START OF CRITICAL DEBUG LOGGING +++
+        logger.info("FLUX_TRAINER_DEBUG: --- Before calling call_dit_func ---")
+        if l_pooled is not None:
+            logger.info(f"FLUX_TRAINER_DEBUG: l_pooled.shape: {l_pooled.shape}, l_pooled.ndim: {l_pooled.ndim}, l_pooled.device: {l_pooled.device}")
+        else:
+            logger.info("FLUX_TRAINER_DEBUG: l_pooled is None")
+
+        if t5_out is not None: # This is 'txt' for the model
+            logger.info(f"FLUX_TRAINER_DEBUG: t5_out (txt).shape: {t5_out.shape}, t5_out.ndim: {t5_out.ndim}, t5_out.device: {t5_out.device}")
+        else:
+            logger.info("FLUX_TRAINER_DEBUG: t5_out (txt) is None")
+            
+        if txt_ids is not None: # This is 'txt_ids' for the model
+            logger.info(f"FLUX_TRAINER_DEBUG: txt_ids.shape: {txt_ids.shape}, txt_ids.ndim: {txt_ids.ndim}, txt_ids.device: {txt_ids.device}")
+        else:
+            logger.info("FLUX_TRAINER_DEBUG: txt_ids is None")
+
+        if img_ids is not None: # This is 'img_ids' for the model
+            logger.info(f"FLUX_TRAINER_DEBUG: img_ids.shape: {img_ids.shape}, img_ids.ndim: {img_ids.ndim}, img_ids.device: {img_ids.device}")
+        else:
+            logger.info("FLUX_TRAINER_DEBUG: img_ids is None")
+            
+        if t5_attn_mask_from_conds is not None: # This is 'txt_attention_mask' for the model
+             logger.info(f"FLUX_TRAINER_DEBUG: t5_attn_mask_from_conds.shape: {t5_attn_mask_from_conds.shape}, t5_attn_mask_from_conds.ndim: {t5_attn_mask_from_conds.ndim}, t5_attn_mask_from_conds.device: {t5_attn_mask_from_conds.device}")
+        else:
+            logger.info("FLUX_TRAINER_DEBUG: t5_attn_mask_from_conds is None")
+        # +++ END OF CRITICAL DEBUG LOGGING +++        
         actual_t5_attn_mask_for_model = t5_attn_mask_from_conds if args.apply_t5_attn_mask else None
 
         def call_dit_func(img_in, img_ids_in, txt_in, txt_ids_in, y_in, timesteps_in, guidance_in, txt_attention_mask_in):
