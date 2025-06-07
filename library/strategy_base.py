@@ -337,8 +337,8 @@ class TextEncoderOutputsCachingStrategy:
         cache_to_disk: bool,
         batch_size: Optional[int],
         skip_disk_cache_validity_check: bool,
-        is_partial: bool = False,
-        is_weighted: bool = False,
+        is_partial: bool = False, # Keep existing __init__ params
+        is_weighted: bool = False, # Keep existing __init__ params
     ) -> None:
         self._cache_to_disk = cache_to_disk
         self._batch_size = batch_size
@@ -347,10 +347,20 @@ class TextEncoderOutputsCachingStrategy:
         self._is_weighted = is_weighted
 
     @classmethod
-    def set_strategy(cls, strategy):
-        if cls._strategy is not None:
-            raise RuntimeError(f"Internal error. {cls.__name__} strategy is already set")
-        cls._strategy = strategy
+    def set_strategy(cls, strategy_instance_to_set): # Use a distinct argument name
+        if cls._strategy is not None and cls._strategy is not strategy_instance_to_set:
+            # Log a warning if a different strategy instance is replacing an existing one
+            logger.warning(
+                f"Overwriting {cls.__name__}._strategy. "
+                f"Old type: {type(cls._strategy).__name__}, New type: {type(strategy_instance_to_set).__name__}"
+            )
+        elif cls._strategy is strategy_instance_to_set:
+            # If the same instance is being set again, it's fine, just return.
+            # logger.debug(f"{cls.__name__} strategy is already set to the same instance.") # Optional: for debugging
+            return
+        
+        # Set or overwrite the strategy
+        cls._strategy = strategy_instance_to_set
 
     @classmethod
     def get_strategy(cls) -> Optional["TextEncoderOutputsCachingStrategy"]:
