@@ -42,10 +42,20 @@ class TokenizeStrategy:
     )
 
     @classmethod
-    def set_strategy(cls, strategy):
-        if cls._strategy is not None:
-            raise RuntimeError(f"Internal error. {cls.__name__} strategy is already set")
-        cls._strategy = strategy
+    def set_strategy(cls, strategy_instance_to_set): # Renamed arg for clarity
+        if cls._strategy is not None and cls._strategy is not strategy_instance_to_set:
+            # Log a warning if a different strategy instance is replacing an existing one
+            logger.warning(
+                f"Overwriting {cls.__name__}._strategy. "
+                f"Old type: {type(cls._strategy).__name__}, New type: {type(strategy_instance_to_set).__name__}"
+            )
+        elif cls._strategy is strategy_instance_to_set:
+            # If the same instance is being set again, it's fine, just return.
+            # logger.debug(f"{cls.__name__} strategy is already set to the same instance.") # Optional debug log
+            return
+        
+        # Set or overwrite the strategy
+        cls._strategy = strategy_instance_to_set
 
     @classmethod
     def get_strategy(cls) -> Optional["TokenizeStrategy"]:
