@@ -1,3 +1,5 @@
+### This is a testing fork and is not working yet  
+
 This repository contains training, generation and utility scripts for Stable Diffusion.
 
 ## FLUX.1 and SD3 training (WIP)
