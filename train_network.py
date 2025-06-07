@@ -361,10 +361,18 @@ class NetworkTrainer:
     def on_validation_step_end(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
         pass
 
+# train_network.py
+
+# ... other imports ...
+from library import strategy_base # Ensure this is imported for strategy_base.TextEncoderOutputsCachingStrategy.get_strategy()
+
+class NetworkTrainer:
+    # ... (other methods) ...
+
     def process_batch(
         self,
         batch,
-        text_encoders,
+        text_encoders, # Original list of TEs, may be on CPU if not trained
         unet,
         network,
         vae,
@@ -373,21 +381,17 @@ class NetworkTrainer:
         weight_dtype,
         accelerator,
         args,
-        text_encoding_strategy: strategy_base.TextEncodingStrategy, # Use base type hint
-        tokenize_strategy: strategy_base.TokenizeStrategy, # Use base type hint
+        text_encoding_strategy: strategy_base.TextEncodingStrategy, 
+        tokenize_strategy: strategy_base.TokenizeStrategy, 
         is_train=True,
-        train_text_encoder=True, 
+        train_text_encoder=True, # Flag indicating if ANY text encoder is being trained
         train_unet=True,
     ) -> torch.Tensor:
-        """
-        Process a batch for the network
-        """
-        # ... (latent processing as before) ...
+        # ... (latent processing as before, up to latents = self.shift_scale_latents(args, latents)) ...
         with torch.no_grad():
             if "latents" in batch and batch["latents"] is not None:
                 latents = typing.cast(torch.FloatTensor, batch["latents"].to(accelerator.device))
             else:
-                # latentに変換
                 if args.vae_batch_size is None or len(batch["images"]) <= args.vae_batch_size:
                     latents = self.encode_images_to_latents(args, vae, batch["images"].to(accelerator.device, dtype=vae_dtype))
                 else:
@@ -405,101 +409,183 @@ class NetworkTrainer:
                     accelerator.print("NaN found in latents, replacing with zeros")
                     latents = typing.cast(torch.FloatTensor, torch.nan_to_num(latents, 0, out=latents))
             latents = self.shift_scale_latents(args, latents)
+            
         logger.info("DEBUG: Entered process_batch.")
         text_encoder_conds = batch.get("text_encoder_outputs_list")
         logger.info(f"DEBUG: batch['text_encoder_outputs_list'] is {'present' if text_encoder_conds is not None else 'missing'}.")
 
-        needs_on_the_fly_encoding = False
-        if train_text_encoder:
+        if args.cache_text_encoder_outputs: # If caching is enabled overall
+            if text_encoder_conds is None:
+                accelerator.print(
+                    "CRITICAL ERROR: Text encoder outputs caching is enabled (--cache_text_encoder_outputs), "
+                    "but pre-cached outputs are not found in the batch. "
+                    "This indicates an issue with the caching process or dataloader not providing cached data. "
+                    "Please ensure text encoder outputs are cached correctly before training. "
+                    "If you intended to train text encoders or encode on-the-fly without cache, disable --cache_text_encoder_outputs."
+                )
+                if "image_keys" in batch and batch["image_keys"]:
+                    current_te_caching_strategy = strategy_base.TextEncoderOutputsCachingStrategy.get_strategy()
+                    if current_te_caching_strategy:
+                        try:
+                            # Assuming image_keys from batch are absolute paths, as set by FineTuneDataset.
+                            first_image_abs_path = batch["image_keys"][0]
+                            expected_npz = current_te_caching_strategy.get_outputs_npz_path(first_image_abs_path)
+                            accelerator.print(f"Example expected cache file for first image in batch: {expected_npz}")
+                        except Exception as e:
+                            accelerator.print(f"Could not determine example cache file path: {e}")
+                raise RuntimeError("Text encoder outputs not found in batch despite caching being enabled.")
+            
+            # If execution reaches here, text_encoder_conds are present (loaded from cache by dataloader).
+            # We only need to perform on-the-fly encoding if text_encoders themselves are being trained.
+            needs_on_the_fly_encoding = train_text_encoder # True if any TE is being trained
+        else: # args.cache_text_encoder_outputs is False
+            # Caching is disabled, so on-the-fly encoding is always necessary.
             needs_on_the_fly_encoding = True
-        else:
-            if text_encoder_conds is None: 
-                needs_on_the_fly_encoding = True
+        
         logger.info(f"DEBUG: needs_on_the_fly_encoding: {needs_on_the_fly_encoding}")
-        if text_encoder_conds is None:
-            text_encoder_conds = [] 
-
+        
         if needs_on_the_fly_encoding:
             logger.info("DEBUG: Entering on-the-fly encoding block.")
             input_ids_list_from_batch = batch.get("input_ids_list")
-            if input_ids_list_from_batch is None and ("captions" not in batch or batch["captions"] is None):
-                accelerator.print(
-                    "CRITICAL ERROR: Attempting on-the-fly text encoding, but "
-                    "neither batch['input_ids_list'] nor batch['captions'] are available."
-                )
-                raise ValueError(
-                    "Cannot perform on-the-fly text encoding: 'input_ids_list' and 'captions' are missing from the batch."
-                )
 
-            encoded_text_encoder_conds_new = None 
+            # Temporarily move text encoders to the accelerator device if they are not already there
+            # (e.g., if they are not trained and thus not prepared by accelerator).
+            models_for_encoding_on_device = []
+            original_devices_for_encoding_models = []
+            # text_encoders is the original list passed to process_batch
+            # self.get_text_encoders_train_flags determines if a TE at a certain index is trained
+            text_encoders_train_flags = self.get_text_encoders_train_flags(args, text_encoders) 
+
+            # self.get_models_for_text_encoding gives the TEs to be used for encoding
+            # (can be different from `text_encoders` list in some complex scenarios, but usually the same)
+            actual_text_encoders_for_encoding = self.get_models_for_text_encoding(args, accelerator, text_encoders)
+
+            for i, te_model in enumerate(actual_text_encoders_for_encoding):
+                if te_model is not None:
+                    original_devices_for_encoding_models.append(te_model.device)
+                    is_te_trained = text_encoders_train_flags[i] if i < len(text_encoders_train_flags) else False
+
+                    if not is_te_trained: # If this specific TE is not trained (and thus not prepared by accelerator)
+                        logger.info(f"DEBUG: Temporarily moving TE {i} ({type(te_model).__name__}) from {te_model.device} to {accelerator.device} for on-the-fly encoding.")
+                        
+                        # Determine target dtype for this TE
+                        # This logic needs to be specific to the trainer (e.g., FluxTrainer might override get_target_dtype_for_te)
+                        # Default behavior:
+                        target_dtype_for_te = weight_dtype # General case
+                        if isinstance(self, FluxNetworkTrainer): # Check if self is FluxNetworkTrainer instance
+                            if i == 0: # CLIP-L for Flux
+                                target_dtype_for_te = weight_dtype 
+                            elif i == 1: # T5XXL for Flux
+                                if args.fp8_base and not args.fp8_base_unet: # T5 is fp8
+                                    # Only cast to fp8 if model isn't already fp8 from loading
+                                    target_dtype_for_te = torch.float8_e4m3fn if not (hasattr(te_model, 'dtype') and te_model.dtype == torch.float8_e4m3fn) else te_model.dtype
+                                else: # T5 is not fp8
+                                    target_dtype_for_te = weight_dtype
+                        
+                        if hasattr(te_model, 'dtype') and te_model.dtype == target_dtype_for_te:
+                             te_model.to(accelerator.device) # Already correct type, just move
+                        else:
+                             te_model.to(accelerator.device, dtype=target_dtype_for_te) # Cast and move
+                    models_for_encoding_on_device.append(te_model)
+                else:
+                    models_for_encoding_on_device.append(None)
+                    original_devices_for_encoding_models.append(None)
+            
             with torch.set_grad_enabled(is_train and train_text_encoder), accelerator.autocast():
                 encode_kwargs = {}
-                # Check if the specific strategy might accept 'apply_t5_attn_mask'
-                # This is a way to pass it if the method signature supports it, without direct type checking
-                # Requires text_encoding_strategy.encode_tokens to handle unexpected kwargs gracefully or define them.
-                # The FluxTextEncodingStrategy already defines it.
-                if hasattr(args, "apply_t5_attn_mask"):
+                # Pass args.apply_t5_attn_mask if the TextEncodingStrategy might use it
+                # This check should ideally be based on the strategy's capabilities or specific trainer args
+                if hasattr(args, "apply_t5_attn_mask") and isinstance(text_encoding_strategy, strategy_flux.FluxTextEncodingStrategy):
                      encode_kwargs['apply_t5_attn_mask'] = args.apply_t5_attn_mask
 
                 if args.weighted_captions: 
                     if "captions" not in batch or batch["captions"] is None:
                          raise ValueError("Weighted captions require 'captions' in batch.")
+                    # Tokenize and move to device
                     input_ids_list_tokenized, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                    
+                    # Assuming tokenize_with_weights returns a list of lists of tensors for SD-style multiple TEs
+                    # For Flux, it might return something different. Adapt as needed.
+                    # For now, assuming generic list of lists of tensors, or strategy handles internal structure.
+                    # The important part is models_for_encoding_on_device is used.
+                    
+                    # Generic way to move tokenized outputs to device if they are tensors or dicts of tensors
+                    def move_tokens_to_device(tokens_data, device):
+                        if isinstance(tokens_data, torch.Tensor):
+                            return tokens_data.to(device)
+                        elif isinstance(tokens_data, list):
+                            return [move_tokens_to_device(t, device) for t in tokens_data]
+                        elif isinstance(tokens_data, dict):
+                            return {k: move_tokens_to_device(v, device) for k, v in tokens_data.items()}
+                        return tokens_data
+
+                    input_ids_list_tokenized_on_device = move_tokens_to_device(input_ids_list_tokenized, accelerator.device)
+                    weights_list_on_device = move_tokens_to_device(weights_list, accelerator.device)
+
                     encoded_text_encoder_conds_new = text_encoding_strategy.encode_tokens_with_weights(
                         tokenize_strategy,
-                        self.get_models_for_text_encoding(args, accelerator, text_encoders), 
-                        input_ids_list_tokenized, 
-                        weights_list,
-                        **encode_kwargs # Pass kwargs here
+                        models_for_encoding_on_device, 
+                        input_ids_list_tokenized_on_device, 
+                        weights_list_on_device,
+                        **encode_kwargs 
                     )
                 else: 
                     input_ids_for_encoding_source = None
                     if input_ids_list_from_batch is not None:
-                        input_ids_for_encoding_source = [ids.to(accelerator.device) for ids in input_ids_list_from_batch]
+                        # These are already tokenized from dataset, move to device
+                        input_ids_for_encoding_source = move_tokens_to_device(input_ids_list_from_batch, accelerator.device)
                     elif "captions" in batch and batch["captions"] is not None:
                         logger.info("DEBUG: Tokenizing captions on-the-fly...")
-                        input_ids_for_encoding_source = tokenize_strategy.tokenize(batch["captions"])
+                        raw_tokens = tokenize_strategy.tokenize(batch["captions"]) # Returns Dict for Flux
+                        input_ids_for_encoding_source = move_tokens_to_device(raw_tokens, accelerator.device)
                         logger.info("DEBUG: Tokenizing complete.")
                     else:
                         raise ValueError("Cannot encode: No 'input_ids_list' or 'captions' in batch.")
+                    
                     logger.info("DEBUG: Encoding tokens...")
-
                     encoded_text_encoder_conds_new = text_encoding_strategy.encode_tokens(
-                        tokenize_strategy,
-                        self.get_models_for_text_encoding(args, accelerator, text_encoders), 
+                        tokenize_strategy, 
+                        models_for_encoding_on_device, 
                         input_ids_for_encoding_source, 
-                        **encode_kwargs # Pass kwargs here
+                        **encode_kwargs 
                     )
                     logger.info("DEBUG: Encoding complete.")
 
-                if args.full_fp16: 
-                    encoded_text_encoder_conds_new = [
-                        c.to(weight_dtype) if c is not None else None for c in encoded_text_encoder_conds_new
-                    ]
+            # Move TEs back to their original devices if they were temporarily moved
+            for i, te_model in enumerate(models_for_encoding_on_device): # Iterates over actual_text_encoders_for_encoding
+                if te_model is not None:
+                    is_te_trained = text_encoders_train_flags[i] if i < len(text_encoders_train_flags) else False
+                    if not is_te_trained and original_devices_for_encoding_models[i] is not None:
+                        # Move back to original device, original dtype should be implicitly restored or model was only moved
+                        logger.info(f"DEBUG: Moving TE {i} ({type(te_model).__name__}) back to {original_devices_for_encoding_models[i]}. Current dtype: {te_model.dtype}")
+                        te_model.to(original_devices_for_encoding_models[i])
+
+            # If TEs are part of full precision training, ensure their outputs match weight_dtype
+            if args.full_fp16 or args.full_bf16:
+                encoded_text_encoder_conds_new = [
+                    (c.to(weight_dtype) if c is not None and c.is_floating_point() else c) for c in encoded_text_encoder_conds_new
+                ]
             
-            if not text_encoder_conds: 
-                text_encoder_conds = encoded_text_encoder_conds_new
-            else:
-                if len(text_encoder_conds) == len(encoded_text_encoder_conds_new):
-                    for i in range(len(encoded_text_encoder_conds_new)):
-                        if encoded_text_encoder_conds_new[i] is not None:
-                            text_encoder_conds[i] = encoded_text_encoder_conds_new[i]
-                else:
-                    accelerator.print(
-                        "Warning: Length mismatch between existing text_encoder_conds and newly encoded_text_encoder_conds. Replacing."
-                    )
-                    text_encoder_conds = encoded_text_encoder_conds_new
-        
-        if text_encoder_conds is None:
+            # Use the newly encoded outputs.
+            # If `train_text_encoder` was true, these new outputs include gradients.
+            # If `train_text_encoder` was false (but caching was also false), these are just new encodings.
+            text_encoder_conds = encoded_text_encoder_conds_new
+        # else: # needs_on_the_fly_encoding is False
+            # This means:
+            #   1. args.cache_text_encoder_outputs was True.
+            #   2. text_encoder_conds were successfully loaded from batch (guarded by the RuntimeError above).
+            #   3. train_text_encoder is False (no TEs are being trained).
+            # So, we use the cached text_encoder_conds directly. They need to be on the correct device for the UNet.
+            # This device transfer is handled within the get_noise_pred_and_target method for Flux-specific trainer.
+            # For SD/SDXL, it would typically happen here before calling get_noise_pred_and_target.
+            # For Flux, text_encoder_conds is a list: [l_pooled, t5_out, txt_ids, t5_attn_mask]
+            # These will be moved to device inside FluxNetworkTrainer.get_noise_pred_and_target
+            pass
+            
+        if text_encoder_conds is None: # Should ideally not be reached if logic above is correct
              num_expected_te_outputs = len(text_encoders) if text_encoders else 1 
-             # A more robust way could be to ask the strategy, if possible, or have a fixed number for known architectures
-             # For Flux, it's 4 (l_pooled, t5_hidden, t5_ids, t5_mask)
-             # This is a fallback, ideally text_encoder_conds should always be a list by now.
-             if text_encoders and hasattr(text_encoders[0], '_is_flux_text_encoder_ensemble_for_instance'): # Pseudo-check
-                 num_expected_te_outputs = 4
-             elif self.is_sdxl : # Assuming self.is_sdxl is set by the trainer
-                 num_expected_te_outputs = 3 # text_hidden, sdxl_pooled, sdxl_text_hidden_2 (approx)
-             
+             if isinstance(self, FluxNetworkTrainer): num_expected_te_outputs = 4
+             elif self.is_sdxl: num_expected_te_outputs = 3
              logger.warning(f"text_encoder_conds is None before calling get_noise_pred_and_target. Defaulting to list of {num_expected_te_outputs} Nones.")
              text_encoder_conds = [None] * num_expected_te_outputs
 
@@ -519,6 +605,7 @@ class NetworkTrainer:
         )
         logger.info("DEBUG: Returned from get_noise_pred_and_target.")
         
+        # ... (rest of loss calculation as before) ...
         huber_c = train_util.get_huber_threshold_if_needed(args, timesteps, noise_scheduler)
         loss = train_util.conditional_loss(noise_pred.float(), target.float(), args.loss_type, "none", huber_c)
         if weighting is not None:
