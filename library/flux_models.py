@@ -341,16 +341,13 @@ class EmbedND(nn.Module):
     def __init__(self, dim: int, theta: int, axes_dim: list[int]): # dim is total pe_dim
         super().__init__()
         self.theta, self.axes_dim = theta, axes_dim
-        # Optional: Check if dim matches sum of axes_dim, though this is already checked in Flux.__init__
         if dim != sum(axes_dim):
             logger.warning(
                 f"EmbedND init: input 'dim' {dim} != sum(axes_dim) {sum(axes_dim)}. "
                 f"Ensure pe_dim in Flux matches sum of axes_dim."
             )
 
-    # Expects one ids_tensor per axis, e.g., ids_for_axis0, ids_for_axis1, ...
-    # Each ids_tensor should be [Batch, SeqLen]
-    def forward(self, *ids_per_axis: Tensor) -> Tensor:
+    def forward(self, *ids_per_axis: Tensor) -> Tensor: # MODIFIED SIGNATURE
         if len(ids_per_axis) != len(self.axes_dim):
             raise ValueError(
                 f"Number of id tensors ({len(ids_per_axis)}) must match number of axes defined by axes_dim ({len(self.axes_dim)})"
@@ -358,27 +355,20 @@ class EmbedND(nn.Module):
 
         all_rope_embeddings = []
         for i in range(len(self.axes_dim)):
-            current_axis_ids = ids_per_axis[i]  # Shape [B, S]
-            current_axis_dim = self.axes_dim[i] # Scalar, e.g., 16, 56, 56
+            current_axis_ids = ids_per_axis[i]  # Shape [B, S_full_sequence]
+            current_axis_dim_for_rope = self.axes_dim[i] 
 
-            if current_axis_dim == 0: # Skip axes with 0 dimension if any
+            if current_axis_dim_for_rope == 0: 
                 continue
             
-            # The 'pos' argument to rope (current_axis_ids) is now [B, S].
-            # rope will produce [B, S, current_axis_dim_half, 2, 2]
-            # then rearrange transforms it to [B, S, current_axis_dim_half, 2, 2] (already this shape)
-            # No, rope returns [B, S, current_axis_dim // 2, 2, 2] if current_axis_dim is passed correctly.
-            # Correction: rope returns [B, S, D_rope_feat, 2, 2] where D_rope_feat is current_axis_dim.
-            # It's actually [B,S, current_axis_dim_per_head_part, 2,2] -> after einsum/stack [B,S,D_half,4] -> rearrange [B,S,D_half,2,2]
-            # So the output of rope is [B, S, D_axis_for_rope//2, 2, 2]
-            # Let's assume `rope` returns features correctly packed for its `dim` input.
-            # The important part is that `current_axis_ids` is [B, S]
-            rope_emb_for_axis = rope(current_axis_ids, current_axis_dim, self.theta)
+            # current_axis_ids (pos for rope) is [B, S_full_sequence]
+            # rope will return [B, S_full_sequence, current_axis_dim_for_rope // 2, 2, 2]
+            rope_emb_for_axis = rope(current_axis_ids, current_axis_dim_for_rope, self.theta)
             all_rope_embeddings.append(rope_emb_for_axis)
         
-        # Concatenate along the RoPE feature dimension (index -3, which is D_axis_for_rope//2)
-        emb = torch.cat(all_rope_embeddings, dim=-3) # Result: [B, S, (sum_of_D_axis_for_rope)//2, 2, 2]
-        return emb.unsqueeze(1) # Add head dimension: [B, 1, S, D_total_pe//2, 2, 2]
+        # Concatenate along the RoPE feature dimension (dim=-3, which is the D_axis_for_rope//2 dimension)
+        emb = torch.cat(all_rope_embeddings, dim=-3) 
+        return emb.unsqueeze(1)
 
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
     original_shape = t.shape
@@ -804,21 +794,26 @@ class Flux(nn.Module):
         self.offloader_single.prepare_block_devices_before_forward(self.single_blocks)
     def forward(self, img: Tensor, img_ids: Tensor, txt: Tensor, txt_ids: Tensor, timesteps: Tensor,
                 y: Tensor, guidance: Tensor | None = None, txt_attention_mask: Tensor | None = None,
-                patch_grid_h: Optional[int] = None, patch_grid_w: Optional[int] = None, **kwargs) -> Tensor: # Add new args
+                patch_grid_h: Optional[int] = None, patch_grid_w: Optional[int] = None, **kwargs) -> Tensor: # MODIFIED SIGNATURE
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError("Inputs img/txt must be 3D.")
         
-        # Check if patch_grid_h and patch_grid_w are provided if img_ids are present
-        # This is crucial for creating spatial embeddings for image patches.
         if img_ids is not None and (patch_grid_h is None or patch_grid_w is None):
-            # Try to infer if S_img is compatible with a 36x28 grid (common for FLUX 1008 patches)
-            if img_ids.shape[1] == 1008: # 36 * 28 = 1008
-                patch_grid_h = 36
-                patch_grid_w = 28
-                logger.info(f"Flux.forward: Inferred patch_grid_h={patch_grid_h}, patch_grid_w={patch_grid_w} for S_img=1008.")
+            # Try to infer if S_img is compatible with a common grid for FLUX if img_ids length matches
+            # Example: 1008 patches for 1024x1024 input (56x56 latents -> 28x36 packed patches, or similar logic)
+            # The logs showed img_ids with S=1008, which corresponds to 36*28 patches.
+            # Latents are [B,16,72,56]. Packed patches are H_lat/2 x W_lat/2 => 36 x 28.
+            if img_ids.shape[1] == (72//2 * 56//2): # 36 * 28 = 1008
+                patch_grid_h = 72 // 2 # 36
+                patch_grid_w = 56 // 2 # 28
+                logger.info(f"Flux.forward: Inferred patch_grid_h={patch_grid_h}, patch_grid_w={patch_grid_w} for S_img={img_ids.shape[1]}.")
             else:
-                raise ValueError("patch_grid_h and patch_grid_w must be provided to Flux.forward when using image positional embeddings.")
+                raise ValueError(
+                    f"patch_grid_h and patch_grid_w must be provided to Flux.forward when using image positional embeddings. "
+                    f"img_ids shape: {img_ids.shape}"
+                )
 
+        # ... (img_p, txt_f, internal_cond_vec, mod_vecs_chroma logic remains the same) ...
         img_p = self.img_in(img)
         if self.distilled_guidance_layer:
             img_p = img_p + self.distilled_guidance_layer(img)
@@ -848,32 +843,32 @@ class Flux(nn.Module):
             approx_in = torch.cat([ts_guid_emb_approx, mod_idx_emb], dim=-1)
             mod_vecs = self.modulation_approximator(approx_in)
             mod_vecs_chroma = distribute_modulations_from_approximator(mod_vecs, self.num_double_blocks, self.num_single_blocks, self.params_dto)
-        
-        # Prepare inputs for EmbedND
-        S_txt = txt_ids.shape[1]
-        S_img = img_ids.shape[1]
-        B = txt_ids.shape[0]
 
-        # Axis 0: 1D sequence IDs (text + image linear patch ID)
-        ids_axis0 = torch.cat((txt_ids, img_ids), dim=1)  # Shape: [B, S_txt + S_img]
+        # MODIFIED: Prepare inputs for EmbedND
+        S_txt = txt_ids.shape[1]
+        S_img = img_ids.shape[1] # These are linear patch IDs
+
+        # Axis 0: 1D sequence IDs (text token id + image linear patch id)
+        ids_axis0 = torch.cat((txt_ids, img_ids), dim=1)
 
         # Axis 1 & 2: Spatial coordinates. Zeros for text, H/W coords for image patches.
-        ids_axis1_text = torch.zeros_like(txt_ids)
-        ids_axis2_text = torch.zeros_like(txt_ids)
+        ids_axis1_text = torch.zeros_like(txt_ids) # Zeros for text tokens on H-axis
+        ids_axis2_text = torch.zeros_like(txt_ids) # Zeros for text tokens on W-axis
 
         # Convert linear img_ids (0 to S_img-1) to 2D H/W coordinates
-        # patch_grid_h and patch_grid_w are the dimensions of the patch grid.
-        img_h_coords = img_ids // patch_grid_w  # Row index
-        img_w_coords = img_ids % patch_grid_w   # Column index
+        # img_ids are already linear patch IDs (0, 1, ..., S_img-1)
+        img_h_coords = img_ids // patch_grid_w  # Row index of the patch
+        img_w_coords = img_ids % patch_grid_w   # Column index of the patch
 
-        ids_axis1_img = img_h_coords # Shape [B, S_img]
-        ids_axis2_img = img_w_coords # Shape [B, S_img]
+        ids_axis1_img = img_h_coords 
+        ids_axis2_img = img_w_coords
 
-        ids_axis1 = torch.cat((ids_axis1_text, ids_axis1_img), dim=1) # Shape: [B, S_txt + S_img]
-        ids_axis2 = torch.cat((ids_axis2_text, ids_axis2_img), dim=1) # Shape: [B, S_txt + S_img]
+        ids_axis1 = torch.cat((ids_axis1_text, ids_axis1_img), dim=1)
+        ids_axis2 = torch.cat((ids_axis2_text, ids_axis2_img), dim=1)
         
-        pe = self.pe_embedder(ids_axis0, ids_axis1, ids_axis2) # Pass three tensors
+        pe = self.pe_embedder(ids_axis0, ids_axis1, ids_axis2) # MODIFIED CALL
 
+        # ... (rest of the forward method: double_blocks, single_blocks, final_layer) ...
         current_img_features = img_p
         current_txt_features = txt_f
 
@@ -888,7 +883,7 @@ class Flux(nn.Module):
         sb_in = torch.cat((current_txt_features, current_img_features), dim=1)
         sb_attn_mask = None
         if txt_attention_mask is not None:
-            img_mask_sb = torch.ones(txt_attention_mask.shape[0], current_img_features.shape[1], device=txt_attention_mask.device, dtype=txt_attention_mask.dtype) # Use dtype of txt_attention_mask
+            img_mask_sb = torch.ones(txt_attention_mask.shape[0], current_img_features.shape[1], device=txt_attention_mask.device, dtype=txt_attention_mask.dtype)
             sb_attn_mask = torch.cat((txt_attention_mask, img_mask_sb), dim=1)
             
         for i, blk in enumerate(self.single_blocks):
