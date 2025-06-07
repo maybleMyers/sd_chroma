@@ -185,43 +185,35 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         """
         Update metadata with FLUX-specific training arguments.
         """
-        super().update_metadata(metadata, args) # Call parent if it ever does something
+        # REMOVED: super().update_metadata(metadata, args) # Parent does not have this method
 
-        metadata["ss_flux_model_type"] = self.model_type_str # Determined during model loading
+        metadata["ss_flux_model_type"] = self.model_type_str 
         
-        # Determine t5xxl_max_token_length as it might not be directly in args if defaulted
-        # (already done in get_tokenize_strategy, can reuse logic or store it)
-        # For simplicity, let's re-evaluate or assume args.t5xxl_max_token_length is populated
-        # if it was user-provided, or take the default used.
-        
-        # Re-determine t5xxl_max_token_length if not directly in args (safer)
         if args.t5xxl_max_token_length is None:
             if self.model_type_str == flux_utils.MODEL_TYPE_FLUX_SCHNELL or \
                self.model_type_str == flux_utils.MODEL_TYPE_CHROMA:
                 effective_t5_max_length = 256
-            else: # Dev or Unknown
+            else: 
                 effective_t5_max_length = 512
         else:
             effective_t5_max_length = args.t5xxl_max_token_length
         
         metadata["ss_t5xxl_max_token_length"] = effective_t5_max_length
         metadata["ss_apply_t5_attn_mask"] = args.apply_t5_attn_mask
-        metadata["ss_guidance_scale_flux"] = args.guidance_scale # Note: different from SD's CFG scale
+        metadata["ss_guidance_scale_flux"] = args.guidance_scale 
         
-        # Timestep sampling specific to FLUX/SD3 style
         metadata["ss_timestep_sampling"] = args.timestep_sampling
         if args.timestep_sampling in ["sigmoid", "shift", "flux_shift"]:
             metadata["ss_sigmoid_scale"] = args.sigmoid_scale
         if args.timestep_sampling == "shift":
             metadata["ss_discrete_flow_shift"] = args.discrete_flow_shift
-        if args.timestep_sampling in ["logit_normal", "mode"]: # SD3 specific, but part of the same arg group
+        if args.timestep_sampling in ["logit_normal", "mode", "cosmap"]: 
             if args.logit_mean is not None: metadata["ss_logit_mean"] = args.logit_mean
             if args.logit_std is not None: metadata["ss_logit_std"] = args.logit_std
             if args.mode_scale is not None: metadata["ss_mode_scale"] = args.mode_scale
         
-        metadata["ss_model_prediction_type_flux"] = args.model_prediction_type # Note: different from SD's v_param
+        metadata["ss_model_prediction_type_flux"] = args.model_prediction_type
 
-        # Add paths to text encoders and AE if they were provided
         if args.clip_l:
             metadata["ss_clip_l_path"] = os.path.basename(args.clip_l) if os.path.exists(args.clip_l) else args.clip_l
         if args.t5xxl:
