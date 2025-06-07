@@ -42,6 +42,18 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.train_clip_l: bool = False  # Initialize here
         self.train_t5xxl: bool = False # Initialize here
 
+    def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True):
+        """
+        Called at the start of each training step. Implements basic logging and ensures compatibility
+        with the base NetworkTrainer's train method.
+        """
+        logger.info(f"Starting training step. Device: {unet.device}, dtype: {weight_dtype}")
+        # Add any Flux-specific step initialization here if needed (e.g., resetting block swaps, updating schedules)
+        if self.is_swapping_blocks:
+            unet.prepare_block_swap_before_forward()
+        # No other specific actions needed for now; can extend later if required
+        pass
+    
     def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:
         if args.timestep_sampling in ["logit_normal", "mode", "cosmap"]: 
             logger.info(f"Using DDPMScheduler for SD3-style timestep sampling: {args.timestep_sampling}")
