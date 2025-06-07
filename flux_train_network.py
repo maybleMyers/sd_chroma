@@ -53,7 +53,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             unet.prepare_block_swap_before_forward()
         # No other specific actions needed for now; can extend later if required
         pass
-    
+
     def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:
         if args.timestep_sampling in ["logit_normal", "mode", "cosmap"]: 
             logger.info(f"Using DDPMScheduler for SD3-style timestep sampling: {args.timestep_sampling}")
@@ -242,27 +242,28 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
     
     def get_text_encoder_outputs_caching_strategy(self, args):
         if args.cache_text_encoder_outputs:
-            if self.model_type_str is None and args.pretrained_model_name_or_path: # Ensure model_type_str is available
+            if self.model_type_str is None and args.pretrained_model_name_or_path:
                 try:
                     self.model_type_str, _, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
                 except Exception as e:
-                    logger.error(f"Could not analyze checkpoint state for caching strategy: {e}. Defaulting has_clip_l.")
-            
-            has_clip_l = False # Default for Chroma or if undetermined
+                    logger.error(f"Could not analyze checkpoint state for caching strategy: {e}. Assuming no CLIP-L.")
+                    self.model_type_str = flux_utils.MODEL_TYPE_CHROMA  # Fallback to Chroma for safety
+    
+            has_clip_l = False
             if self.model_type_str in [flux_utils.MODEL_TYPE_FLUX_DEV, flux_utils.MODEL_TYPE_FLUX_SCHNELL]:
                 has_clip_l = True
-            elif args.clip_l is not None and self.model_type_str != flux_utils.MODEL_TYPE_CHROMA: # Fallback if model_type_str is None but clip_l provided
+            elif args.clip_l is not None:
                 has_clip_l = True
-
-
+                logger.warning("CLIP-L path provided, but model type is Chroma or undetermined. CLIP-L will be ignored for Chroma.")
+    
             return strategy_flux.FluxTextEncoderOutputsCachingStrategy(
                 args.cache_text_encoder_outputs_to_disk,
-                args.text_encoder_batch_size, 
+                args.text_encoder_batch_size,
                 args.skip_cache_check,
-                has_clip_l=has_clip_l, 
-                is_train_clip_l=self.train_clip_l, # Relies on self.train_clip_l being set by assert_extra_args
-                is_train_t5=self.train_t5xxl,     # Relies on self.train_t5xxl being set by assert_extra_args
-                apply_t5_attn_mask=args.apply_t5_attn_mask, 
+                has_clip_l=has_clip_l,
+                is_train_clip_l=self.train_clip_l,
+                is_train_t5=self.train_t5xxl,
+                apply_t5_attn_mask=args.apply_t5_attn_mask,
             )
         return None
 
@@ -502,54 +503,52 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 clean_memory_on_device(accelerator.device)
 
             logger.info("move text encoders to gpu for caching")
-            active_text_encoders_for_caching = [] # Initialize
+            active_text_encoders_for_caching = []
 
             # Handle CLIP-L (expected at text_encoders[0])
             clip_l_for_caching = None
-            if text_encoders[0] is not None: # CLIP-L model object exists
+            if text_encoders[0] is not None:  # CLIP-L model object exists
                 text_encoders[0].to(accelerator.device, dtype=weight_dtype)
                 clip_l_for_caching = text_encoders[0]
-            active_text_encoders_for_caching.append(clip_l_for_caching) # Append CLIP-L or None
+            active_text_encoders_for_caching.append(clip_l_for_caching)  # Append CLIP-L or None
 
             # Handle T5XXL (expected at text_encoders[1])
             t5xxl_for_caching = None
-            if len(text_encoders) > 1 and text_encoders[1] is not None: # T5XXL model object exists
-                text_encoders[1].to(accelerator.device) # Move to device first
-                if hasattr(text_encoders[1], 'dtype') and text_encoders[1].dtype == torch.float8_e4m3fn: # Check if it's already fp8
-                    # If T5 is fp8, it might have specific handling (like prepare_text_encoder_fp8)
-                    # Assuming prepare_text_encoder_fp8 handles dtype conversion if necessary or prepares it.
-                    if hasattr(self, 'prepare_text_encoder_fp8'): # ensure method exists
-                         self.prepare_text_encoder_fp8(1, text_encoders[1], text_encoders[1].dtype, weight_dtype)
-                    # If not fp8, convert to weight_dtype
+            if len(text_encoders) > 1 and text_encoders[1] is not None:  # T5XXL model object exists
+                text_encoders[1].to(accelerator.device)
+                if hasattr(text_encoders[1], 'dtype') and text_encoders[1].dtype == torch.float8_e4m3fn:
+                    if hasattr(self, 'prepare_text_encoder_fp8'):
+                        self.prepare_text_encoder_fp8(1, text_encoders[1], text_encoders[1].dtype, weight_dtype)
+                    else:
+                        text_encoders[1].to(dtype=weight_dtype)
                 else:
                     text_encoders[1].to(dtype=weight_dtype)
                 t5xxl_for_caching = text_encoders[1]
             else:
-                # This case should ideally not happen if flux_train_network.py setup is correct,
-                # as T5XXL is mandatory for FLUX.
-                logger.error("T5XXL model (text_encoders[1]) is None or not provided during caching setup.")
-                # Fallback or raise error depending on strictness, appending None for now.
-            active_text_encoders_for_caching.append(t5xxl_for_caching) # Append T5XXL or None
+                logger.error("T5XXL model is required for caching but is None or not provided.")
+                raise ValueError("T5XXL model (text_encoders[1]) is missing during caching setup.")
+            active_text_encoders_for_caching.append(t5xxl_for_caching)
 
-            # At this point, active_text_encoders_for_caching should be [clip_l_or_None, t5xxl_model_or_None]
-            # Ensure T5XXL is actually present if needed by strategy
-            if active_text_encoders_for_caching[1] is None:
-                 logger.warning("T5XXL model is effectively None for caching. This might lead to errors in FluxTextEncodingStrategy if it strictly requires T5.")
-
+            # Set the caching strategy explicitly before caching
+            caching_strategy = self.get_text_encoder_outputs_caching_strategy(args)
+            strategy_base.TextEncoderOutputsCachingStrategy.set_strategy(caching_strategy)
 
             # Cache outputs for the main dataset
+            logger.info("Caching text encoder outputs for dataset")
             with accelerator.autocast():
-                dataset.new_cache_text_encoder_outputs(active_text_encoders_for_caching, accelerator)
+                try:
+                    dataset.new_cache_text_encoder_outputs(active_text_encoders_for_caching, accelerator)
+                except Exception as e:
+                    logger.error(f"Failed to cache text encoder outputs: {e}")
+                    raise
 
             # Cache outputs for sample prompts if specified
             if args.sample_prompts is not None:
                 logger.info(f"cache Text Encoder outputs for sample prompt: {args.sample_prompts}")
                 tokenize_strategy: strategy_flux.FluxTokenizeStrategy = strategy_base.TokenizeStrategy.get_strategy()
-                
-                # Get the globally set text encoding strategy, which should be FluxTextEncodingStrategy
                 current_text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
                 assert isinstance(current_text_encoding_strategy, strategy_flux.FluxTextEncodingStrategy), \
-                    f"Expected FluxTextEncodingStrategy for sample prompts, got {type(current_text_encoding_strategy)}"
+                    f"Expected FluxTextEncodingStrategy, got {type(current_text_encoding_strategy)}"
 
                 prompts = train_util.load_prompts(args.sample_prompts)
                 sample_prompts_te_outputs = {}
@@ -558,33 +557,22 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                         for p in [prompt_dict.get("prompt", ""), prompt_dict.get("negative_prompt", "")]:
                             if p not in sample_prompts_te_outputs:
                                 logger.info(f"cache Text Encoder outputs for prompt: {p}")
-                                tokens_and_masks = tokenize_strategy.tokenize(p) # Tokenize for both/all
-                                # active_text_encoders_for_caching is [clip_l_or_None, t5xxl_or_None]
+                                tokens_and_masks = tokenize_strategy.tokenize(p)
                                 sample_prompts_te_outputs[p] = current_text_encoding_strategy.encode_tokens(
                                     tokenize_strategy, active_text_encoders_for_caching, tokens_and_masks, args.apply_t5_attn_mask
                                 )
                 self.sample_prompts_te_outputs = sample_prompts_te_outputs
-            
+
             accelerator.wait_for_everyone()
 
             # Move text encoders back to CPU if they are not being trained
-            # Check if the specific encoder in active_text_encoders_for_caching is not None before moving
-            if active_text_encoders_for_caching[0] is not None and not self.is_train_text_encoder(args): # Checks all TEs based on base class
-                # More specific check might be needed if self.is_train_text_encoder doesn't discern CLIP-L vs T5XXL
-                # Assuming if any TE is trained, self.is_train_text_encoder is True.
-                # Or use self.train_clip_l if it's accurately set.
-                if hasattr(self, 'train_clip_l') and not self.train_clip_l :
-                    logger.info("move CLIP-L back to cpu")
-                    active_text_encoders_for_caching[0].to("cpu")
-                elif not hasattr(self, 'train_clip_l') and not self.is_train_text_encoder(args): # Fallback if train_clip_l not present
-                    logger.info("move CLIP-L back to cpu (general TE train flag)")
-                    active_text_encoders_for_caching[0].to("cpu")
-
-
-            if active_text_encoders_for_caching[1] is not None and not self.train_t5xxl: # self.train_t5xxl should exist
-                logger.info("move t5XXL back to cpu")
+            if active_text_encoders_for_caching[0] is not None and not self.train_clip_l:
+                logger.info("move CLIP-L back to cpu")
+                active_text_encoders_for_caching[0].to("cpu")
+            if active_text_encoders_for_caching[1] is not None and not self.train_t5xxl:
+                logger.info("move T5XXL back to cpu")
                 active_text_encoders_for_caching[1].to("cpu")
-            
+
             clean_memory_on_device(accelerator.device)
 
             # Move diffusion model and VAE back to original device
@@ -593,22 +581,14 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 vae.to(org_vae_device)
                 unet.to(org_unet_device)
         else:
-            # If not caching, move all available text encoders to device for training
-            if text_encoders[0] is not None: # CLIP-L
+            # If not caching, move available text encoders to device
+            if text_encoders[0] is not None:
                 text_encoders[0].to(accelerator.device, dtype=weight_dtype)
-            
-            if len(text_encoders) > 1 and text_encoders[1] is not None: # T5XXL
-                # Check for fp8 before setting dtype to weight_dtype, as fp8 has its own dtype.
+            if len(text_encoders) > 1 and text_encoders[1] is not None:
                 if hasattr(text_encoders[1], 'dtype') and text_encoders[1].dtype == torch.float8_e4m3fn:
-                    text_encoders[1].to(accelerator.device) # Already fp8, just move to device
+                    text_encoders[1].to(accelerator.device)
                 else:
                     text_encoders[1].to(accelerator.device, dtype=weight_dtype)
-            elif len(text_encoders) == 1 and text_encoders[0] is not None and hasattr(text_encoders[0], 'config') and 't5' in text_encoders[0].config.model_type.lower():
-                # Case where only T5XXL is passed as text_encoders[0]
-                if hasattr(text_encoders[0], 'dtype') and text_encoders[0].dtype == torch.float8_e4m3fn:
-                    text_encoders[0].to(accelerator.device)
-                else:
-                    text_encoders[0].to(accelerator.device, dtype=weight_dtype)
 
     def get_models_for_text_encoding(self, args, accelerator, text_encoders): # text_encoders are the original loaded models e.g. [clip_l_model_or_None, t5_model]
         return text_encoders
