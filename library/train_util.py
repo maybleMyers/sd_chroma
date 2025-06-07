@@ -2357,7 +2357,7 @@ class FineTuningDataset(BaseDataset):
                 if self.latents_caching_strategy:
                     # Pass image_info_obj.bucket_reso as the 'image_size' argument for path generation
                     image_info_obj.latents_npz = self.latents_caching_strategy.get_latents_npz_path(
-                        image_info_obj.absolute_path, image_info_obj.bucket_reso 
+                        image_info_obj.absolute_path, image_info_obj.image_size # MUST be original image_size
                     )
                 if self.text_encoder_output_caching_strategy:
                     image_info_obj.text_encoder_outputs_npz = self.text_encoder_output_caching_strategy.get_outputs_npz_path(
