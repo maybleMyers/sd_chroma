@@ -1,4 +1,3 @@
-# flux_train_network.py
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
@@ -9,6 +8,7 @@ from typing import Any, Optional, Union
 
 import torch
 from accelerate import Accelerator
+from diffusers import DDPMScheduler # <--- ADD THIS IMPORT
 
 from library.device_utils import clean_memory_on_device, init_ipex
 
@@ -19,10 +19,11 @@ from library import (
     flux_models,
     flux_train_utils,
     flux_utils,
-    sd3_train_utils,
+    sd3_train_utils, # This import seems unused now, sd3_train_utils might have been for previous SD3 attempts
     strategy_base,
     strategy_flux,
     train_util,
+    custom_train_functions, # Import for fix_noise_scheduler_betas_for_zero_terminal_snr
 )
 from library.utils import setup_logging
 
@@ -42,46 +43,19 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.train_t5xxl: bool = False # Initialize here
 
     def get_noise_scheduler(self, args: argparse.Namespace, device: torch.device) -> Any:
-        # FLUX.1 and SD3 typically don't use a "noise scheduler" in the same way Diffusers' DDPMScheduler is used for SD1.5/2.x.
-        # Timesteps are often handled as continuous values (0-1 or 0-1000) and sigmas are derived.
-        # The logic for noising and timesteps is in flux_train_utils.get_noisy_model_input_and_timesteps.
-        # For compatibility with the trainer structure, we might return a placeholder or a simplified object
-        # if the trainer's main loop absolutely needs a scheduler object for some functions (e.g., min_snr_gamma).
-        # However, flux_train_utils.get_noisy_model_input_and_timesteps uses args directly.
-        # For now, let's acknowledge that flux_train_utils handles it.
-        # If parts of the main train loop (like SNR gamma) *require* a scheduler object with specific attributes (like sigmas),
-        # we might need to create a dummy scheduler or adapt those parts.
-        # For min_snr_gamma, it needs noise_scheduler.alphas_cumprod.
-        # The DiT/Flux models use a direct sigma formulation, so SNR gamma might not be directly applicable
-        # or would need re-derivation based on sigmas.
-        
-        # Let's see if a DDPMScheduler can be configured to be mostly passive or if specific values are needed by flux_train_utils.
-        # flux_train_utils.get_noisy_model_input_and_timesteps uses noise_scheduler.config.num_train_timesteps
-        # and noise_scheduler.timesteps / noise_scheduler.sigmas for SD3 style weighting.
-
-        if args.timestep_sampling in ["logit_normal", "mode", "cosmap"]: # SD3-like sampling needs a scheduler for sigmas
+        if args.timestep_sampling in ["logit_normal", "mode", "cosmap"]: 
             logger.info(f"Using DDPMScheduler for SD3-style timestep sampling: {args.timestep_sampling}")
-            # This scheduler's beta schedule might not be directly used for FLUX style flow matching,
-            # but its timesteps and sigmas attributes are used by get_sigmas in flux_train_utils.
             noise_scheduler = DDPMScheduler(
                 beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", 
                 num_train_timesteps=1000, clip_sample=False,
-                # SD3 specific scheduler settings if any, e.g. "interpolation_type" for RectifiedFlowScheduler
-                # For now, DDPMScheduler is used to provide .sigmas and .timesteps
             )
-            # train_util.prepare_scheduler_for_custom_training(noise_scheduler, device) # Not strictly needed if only sigmas/timesteps are used
-            if args.zero_terminal_snr: # This modifies betas, might affect sigmas for SD3
+            # train_util.prepare_scheduler_for_custom_training(noise_scheduler, device) # Not strictly needed here
+            if args.zero_terminal_snr: 
                 custom_train_functions.fix_noise_scheduler_betas_for_zero_terminal_snr(noise_scheduler)
             return noise_scheduler
-        else: # FLUX specific or other simple samplings
-            # For FLUX's own "shift" or "flux_shift", a full scheduler object isn't strictly necessary
-            # as timesteps are derived from args.sigmoid_scale etc.
-            # However, `post_process_loss` in the base trainer might still expect a scheduler.
-            # Let's return a simple object or None if those parts are also overridden.
-            # Given post_process_loss needs overriding anyway, this can be simplified.
+        else: 
             logger.info(f"FLUX timestep sampling ({args.timestep_sampling}) does not strictly require a Diffusers scheduler object here. Returning a basic DDPMScheduler for compatibility.")
-            # Provide a basic scheduler for num_train_timesteps if used by get_noisy_model_input_and_timesteps
-            return DDPMScheduler(num_train_timesteps=1000) # Or derive from args if there's a flux_num_steps
+            return DDPMScheduler(num_train_timesteps=1000) 
 
     def sample_images(self, accelerator, args, epoch, global_step, device, vae, tokenizers, text_encoders, unet):
         # tokenizers will be [clip_l_tokenizer_or_None, t5_tokenizer]
