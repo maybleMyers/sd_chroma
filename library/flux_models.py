@@ -459,11 +459,14 @@ class LastLayer(nn.Module):
             log_tensor_stats(x_mod, "LastLayer_x_mod_with_adaLN", logger_obj=logger)
         else:
             x_mod = x_normed
-            log_tensor_stats(x_mod, "LastLayer_x_mod_no_adaLN", logger_obj=logger)
+            log_tensor_stats(x_mod, "LastLayer_x_mod_no_adaLN", logger_obj=logger) # Should be float32, non-NaN
 
-        # You can also log the weight dtype of the linear layer if needed
-        # logger.debug(f"LastLayer: self.linear.weight.dtype: {self.linear.weight.dtype}")
-        x_out = self.linear(x_mod)
+        log_tensor_stats(self.linear.weight, "LastLayer_self.linear.weight", logger_obj=logger)
+        if self.linear.bias is not None:
+            log_tensor_stats(self.linear.bias, "LastLayer_self.linear.bias", logger_obj=logger)
+        
+        x_out = self.linear(x_mod) # x_mod is float32, self.linear.weight is bf16. Autocast should handle this.
+                                   # Expected: x_mod cast to bf16, matmul in bf16, output bf16.
         log_tensor_stats(x_out, "LastLayer_x_out_FINAL", logger_obj=logger)
         return x_out
 
