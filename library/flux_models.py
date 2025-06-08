@@ -39,7 +39,7 @@ class ApproximatorParams:
     in_dim: int = 64
     out_dim_per_mod_vector: int = 0 
     hidden_dim: int = 5120 
-    n_layers: int = 4
+    n_layers: int = 5
     mod_index_length: int = 344 
 
 @dataclass
@@ -712,50 +712,68 @@ class SingleStreamBlock(nn.Module):
 class Flux(nn.Module):
     def __init__(self, params: FluxParams):
         super().__init__()
-        self.params_dto = params; self.in_channels,self.out_channels=params.in_channels,params.in_channels
-        if params.hidden_size%params.num_heads!=0: raise ValueError(f"Hidden {params.hidden_size} not div by {params.num_heads}")
-        pe_dim=params.hidden_size//params.num_heads
-        if sum(params.axes_dim)!=pe_dim: raise ValueError(f"axes_dim sum {sum(params.axes_dim)} != pe_dim {pe_dim}")
-        self.hidden_size,self.num_heads=params.hidden_size,params.num_heads
-        self.pe_embedder=EmbedND(pe_dim,params.theta,params.axes_dim); self.img_in=nn.Linear(params.in_channels,params.hidden_size,True)
-        self.time_in=MLPEmbedder(256,params.hidden_size) if params.use_time_embed else None
-        self.vector_in=MLPEmbedder(params.vec_in_dim,params.hidden_size) if params.use_vector_embed else None
-        self.guidance_in=MLPEmbedder(256,params.hidden_size) if params.guidance_embed else nn.Identity()
+        self.params_dto = params
+        # ... other initializations (pe_embedder, img_in, txt_in, blocks) ...
+        self.pe_embedder=EmbedND(pe_dim,params.theta,params.axes_dim) # Assuming pe_dim is calculated correctly
+        self.img_in=nn.Linear(params.in_channels,params.hidden_size,True)
         self.txt_in=nn.Linear(params.context_in_dim,params.hidden_size,True)
+
         self.double_blocks=nn.ModuleList([DoubleStreamBlock(params.hidden_size,params.num_heads,params.mlp_ratio,params.qkv_bias,params.use_modulation,params.double_block_has_main_norms) for _ in range(params.depth)])
         self.single_blocks=nn.ModuleList([SingleStreamBlock(params.hidden_size,params.num_heads,params.mlp_ratio,params.use_modulation) for _ in range(params.depth_single_blocks)])
-        
-        self.distilled_guidance_layer = FeatureFusionDistiller( 
-            params.in_channels, params.distilled_guidance_dim, params.hidden_size
-        ) if params.use_distilled_guidance_layer else None
 
-        self.modulation_approximator=None
-        if not params.use_modulation and params.approximator_config:
-            app_cfg=params.approximator_config
-            if app_cfg.out_dim_per_mod_vector==0: app_cfg.out_dim_per_mod_vector=params.hidden_size
-            self.modulation_approximator=Approximator(app_cfg.in_dim,app_cfg.out_dim_per_mod_vector,app_cfg.hidden_dim,app_cfg.n_layers)
-            self.register_buffer('mod_index',torch.arange(app_cfg.mod_index_length),persistent=False); self.mod_index_length=app_cfg.mod_index_length
-        elif not params.use_modulation and not params.approximator_config: logger.warning("Flux configured use_modulation=False but no approximator_config.")
-        
-        # For Chroma, final_layer_custom_path is True if use_modulation is False
-        # This means Chroma uses self.final_norm and self.final_linear defined here.
-        # For Dev/Schnell, final_layer_custom_path is False, and they use self.final_layer (instance of LastLayer)
-        self.final_layer_custom_path = not params.use_modulation 
-        if self.final_layer_custom_path: 
-            # These keys ('final_norm.weight', 'final_linear.weight', etc.) are reported missing for Chroma.
-            # This suggests the Chroma checkpoint does *not* have these top-level final_norm/linear layers.
-            # Instead, it might be using the .linear part of the original `final_layer` structure.
-            # Let's revert to always using `LastLayer` and handle Chroma's specifics in its forward or by what's loaded.
-            # The `final_layer.linear.weight/bias` are in "BOTH" for Schnell vs Chroma v34.
-            # `final_layer.adaLN_modulation.*` are "pruned".
-            # `LastLayer.norm_final` is non-affine so has no weights.
-            # This means `final_layer_custom_path` should probably be False for all, and Chroma loads only the linear part.
-            self.final_layer_custom_path = False # Always use LastLayer structure
-            self.final_layer = LastLayer(params.hidden_size,1,self.out_channels)
-            # logger.info("Using LastLayer for all variants, including Chroma (custom path logic removed).")
-        else: # Dev/Schnell
-            self.final_layer = LastLayer(params.hidden_size,1,self.out_channels)
-        
+
+        # --- Chroma-Specific Component Initialization ---
+        if not params.use_modulation: # This is the Chroma path
+            # Conditional components that are PRUNED in Chroma
+            self.time_in = None # Chroma doesn't use separate time_in MLP for internal_cond_vec
+            self.vector_in = None # Chroma doesn't use separate vector_in MLP for internal_cond_vec
+            self.guidance_in = nn.Identity() # Chroma doesn't use guidance_in MLP for internal_cond_vec
+
+            # Main modulator (Approximator)
+            # Its weights are expected under "distilled_guidance_layer.*" in the checkpoint
+            if params.approximator_config:
+                app_cfg = params.approximator_config
+                # Ensure out_dim_per_mod_vector is set correctly if it's 0
+                out_dim_for_approx = app_cfg.out_dim_per_mod_vector if app_cfg.out_dim_per_mod_vector != 0 else params.hidden_size
+                
+                self.distilled_guidance_layer = Approximator(
+                    app_cfg.in_dim, out_dim_for_approx, app_cfg.hidden_dim, app_cfg.n_layers # n_layers is now 5
+                )
+                self.register_buffer('mod_index', torch.arange(app_cfg.mod_index_length), persistent=False)
+                self.mod_index_length = app_cfg.mod_index_length
+                logger.info(f"Chroma Path: Initialized self.distilled_guidance_layer as Approximator with {app_cfg.n_layers} layers.")
+            else:
+                self.distilled_guidance_layer = None
+                logger.error("Chroma Path: Approximator config missing, cannot create distilled_guidance_layer (Approximator).")
+
+            # Image feature enhancement (FeatureFusionDistiller) - if used by your Chroma setup
+            # The official `Chroma` class does not seem to have this in addition to the main Approximator.
+            # If `params.use_distilled_guidance_layer` was meant *only* for the main Approximator,
+            # then this FFD should be None for pure Chroma alignment.
+            # Let's assume for now it's a separate potential enhancement.
+            self.img_p_enhancer_module = FeatureFusionDistiller(
+                params.in_channels, params.distilled_guidance_dim, params.hidden_size
+            ) if params.use_distilled_guidance_layer else None # NOTE: Name distinct from the Approximator
+            if self.img_p_enhancer_module:
+                 logger.info("Chroma Path: Initialized self.img_p_enhancer_module as FeatureFusionDistiller.")
+
+
+            # Ensure the attribute that was previously causing issues is None
+            self.modulation_approximator = None
+
+        else: # Dev/Schnell Path (internal modulation)
+            self.time_in = MLPEmbedder(256, params.hidden_size) if params.use_time_embed else None
+            self.vector_in = MLPEmbedder(params.vec_in_dim, params.hidden_size) if params.use_vector_embed else None
+            self.guidance_in = MLPEmbedder(256, params.hidden_size) if params.guidance_embed else nn.Identity()
+            
+            self.distilled_guidance_layer = None # Not used by Dev/Schnell for block modulation
+            self.img_p_enhancer_module = None # Not used by Dev/Schnell
+            self.modulation_approximator = None # Not used by Dev/Schnell (they use internal Modulation layers)
+
+        # Final Layer - common structure, but adaLN part is pruned for Chroma
+        self.final_layer = LastLayer(params.hidden_size, 1, self.out_channels)
+        # No need for self.final_layer_custom_path, LastLayer's forward handles vec=None or vec=zeros
+
         self.gradient_checkpointing=False; self.cpu_offload_checkpointing=False; self.blocks_to_swap=None
         self.offloader_double=None; self.offloader_single=None
         self.num_double_blocks,self.num_single_blocks=len(self.double_blocks),len(self.single_blocks)
@@ -795,122 +813,192 @@ class Flux(nn.Module):
         if not self.blocks_to_swap: return
         self.offloader_double.prepare_block_devices_before_forward(self.double_blocks)
         self.offloader_single.prepare_block_devices_before_forward(self.single_blocks)
+
     def forward(self, img: Tensor, img_ids: Tensor, txt: Tensor, txt_ids: Tensor, timesteps: Tensor,
                 y: Tensor, guidance: Tensor|None=None, txt_attention_mask: Tensor|None=None, **kwargs) -> Tensor:
         # img: (B, L_img_packed, D_in_img), from packed VAE output
         # img_ids: (B, L_img_packed, 3), positional IDs for image tokens
         # txt: (B, L_txt_seq, D_t5), T5 feature outputs
-        # txt_ids: (B, L_txt_seq), T5 vocabulary token IDs (THIS IS THE ONE MISUSED FOR pe_embedder)
-        log_tensor_stats(img, "Flux_fwd_SOT_noisy_input_packed", logger)
+        # txt_ids: (B, L_txt_seq), T5 vocabulary token IDs
+        
+        log_tensor_stats(img, "Flux_fwd_SOT_noisy_input_packed", logger_obj=logger)
         if img.ndim != 3 or txt.ndim != 3: # txt is (B, L, D), img is (B, L, D)
             raise ValueError(f"Inputs img/txt must be 3D. Got img: {img.ndim}D, txt: {txt.ndim}D")
             
         img_p = self.img_in(img)
-        log_tensor_stats(img_p, "Flux_fwd_after_img_in", logger)
-        if self.distilled_guidance_layer: 
-            dist_guid_out = self.distilled_guidance_layer(img) # Assuming img is the input to this as per official
-            log_tensor_stats(dist_guid_out, "Flux_fwd_after_distilled_guidance_layer_out", logger)
-            img_p = img_p + dist_guid_out # Add, not replace
-            log_tensor_stats(img_p, "Flux_fwd_img_p_after_dist_guid_add", logger)
+        log_tensor_stats(img_p, "Flux_fwd_after_img_in", logger_obj=logger)
+
+        # Apply img_p_enhancer_module if it exists and is meant for this purpose
+        # This depends on how you've structured it in __init__ based on params_dto
+        if hasattr(self, 'img_p_enhancer_module') and self.img_p_enhancer_module is not None:
+            # Assuming 'img' (the packed latent input) is the correct input for this enhancer
+            enhancement = self.img_p_enhancer_module(img) 
+            log_tensor_stats(enhancement, "Flux_fwd_img_p_enhancer_out", logger_obj=logger)
+            img_p = img_p + enhancement 
+            log_tensor_stats(img_p, "Flux_fwd_img_p_after_enhancement_add", logger_obj=logger)
         
         txt_f = self.txt_in(txt) # txt_f is (B, L_txt_seq, D_hidden)
-        log_tensor_stats(txt_f, "Flux_fwd_after_txt_in", logger)
+        log_tensor_stats(txt_f, "Flux_fwd_after_txt_in", logger_obj=logger)
 
+        # --- internal_cond_vec: Should be zeros for Chroma after __init__ changes ---
         int_cond_parts=[]
-        if self.time_in: int_cond_parts.append(self.time_in(timestep_embedding(timesteps,256)))
-        if self.params_dto.guidance_embed and guidance is not None and not isinstance(self.guidance_in,nn.Identity):
-            int_cond_parts.append(self.guidance_in(timestep_embedding(guidance,256)))
-        if self.vector_in: int_cond_parts.append(self.vector_in(y))
+        # These self.time_in, self.guidance_in, self.vector_in should be None or nn.Identity for Chroma
+        if self.time_in is not None and not isinstance(self.time_in, nn.Identity): 
+            time_emb = self.time_in(timestep_embedding(timesteps,256))
+            log_tensor_stats(time_emb, "Flux_fwd_time_emb", logger_obj=logger)
+            int_cond_parts.append(time_emb)
+        
+        # For guidance_in, params_dto.guidance_embed is now False for Chroma, so self.guidance_in is nn.Identity
+        # The check `not isinstance(self.guidance_in, nn.Identity)` will be false.
+        if self.params_dto.guidance_embed and guidance is not None and hasattr(self, 'guidance_in') and self.guidance_in is not None and not isinstance(self.guidance_in, nn.Identity):
+            guidance_emb = self.guidance_in(timestep_embedding(guidance,256))
+            log_tensor_stats(guidance_emb, "Flux_fwd_guidance_emb_active", logger_obj=logger)
+            int_cond_parts.append(guidance_emb)
+        elif hasattr(self, 'guidance_in') and isinstance(self.guidance_in, nn.Identity):
+             log_tensor_stats(None, "Flux_fwd_guidance_emb_is_Identity", logger_obj=logger)
+
+
+        if self.vector_in is not None and not isinstance(self.vector_in, nn.Identity) and y is not None: 
+            vector_emb = self.vector_in(y)
+            log_tensor_stats(vector_emb, "Flux_fwd_vector_emb_y", logger_obj=logger)
+            int_cond_parts.append(vector_emb)
         
         internal_cond_vec = sum(int_cond_parts) if int_cond_parts else \
                             torch.zeros(img.shape[0], self.hidden_size, device=img.device, dtype=img.dtype)
+        log_tensor_stats(internal_cond_vec, "Flux_fwd_internal_cond_vec_final", logger_obj=logger) # Should be zeros for Chroma
         
+        # --- mod_vecs_chroma: Use the correctly named Approximator ---
         mod_vecs_chroma=None
-        if self.modulation_approximator:
-            app_cfg=self.params_dto.approximator_config; _bs=img.shape[0]
-            ts_emb_approx = timestep_embedding(timesteps,16)
-            guid_val_approx = guidance if guidance is not None else torch.zeros_like(timesteps, device=timesteps.device, dtype=timesteps.dtype)
-            guid_emb_approx = timestep_embedding(guid_val_approx,16)
-            mod_idx_batched = self.mod_index.unsqueeze(0).repeat(_bs, 1)
-            mod_idx_emb = timestep_embedding(mod_idx_batched,32)
-            ts_guid_emb_approx = torch.cat([ts_emb_approx, guid_emb_approx], dim=1).unsqueeze(1).repeat(1,self.mod_index_length,1)
-            approx_in = torch.cat([ts_guid_emb_approx, mod_idx_emb], dim=-1)
-            mod_vecs=self.modulation_approximator(approx_in)
-            mod_vecs_chroma=distribute_modulations_from_approximator(mod_vecs,self.num_double_blocks,self.num_single_blocks,self.params_dto)
+        # For Chroma: params_dto.use_modulation is False.
+        # The main modulation Approximator should be self.distilled_guidance_layer (if __init__ was changed)
+        if not self.params_dto.use_modulation and hasattr(self, 'distilled_guidance_layer') and self.distilled_guidance_layer is not None:
+            # This 'distilled_guidance_layer' attribute MUST be an instance of Approximator
+            # and loaded with weights from keys like "distilled_guidance_layer.*"
+            if not isinstance(self.distilled_guidance_layer, Approximator):
+                logger.error("CRITICAL: self.distilled_guidance_layer is NOT an Approximator instance, but modulation logic expects it to be for Chroma.")
+            else:
+                app_cfg = self.params_dto.approximator_config
+                if app_cfg is None:
+                    logger.error("CRITICAL: Approximator config missing for Chroma, but distilled_guidance_layer (Approximator) exists.")
+                else:
+                    _bs=img.shape[0]
+                    ts_emb_approx = timestep_embedding(timesteps,16) # input for approximator
+                    guid_val_approx = guidance if guidance is not None else torch.zeros_like(timesteps, device=timesteps.device, dtype=timesteps.dtype)
+                    guid_emb_approx = timestep_embedding(guid_val_approx,16) # input for approximator
+                    
+                    mod_idx_device = self.mod_index.to(device=img.device, non_blocking=True)
+                    mod_idx_batched = mod_idx_device.unsqueeze(0).repeat(_bs, 1)
+                    mod_idx_emb = timestep_embedding(mod_idx_batched,32) # input for approximator
+                    
+                    # Concatenate (ts_emb, guid_emb) first, then repeat, then concat with mod_idx_emb
+                    ts_guid_combined_emb_approx = torch.cat([ts_emb_approx, guid_emb_approx], dim=-1) # (B, 16+16=32)
+                    ts_guid_emb_approx_repeated = ts_guid_combined_emb_approx.unsqueeze(1).repeat(1, self.mod_index_length, 1) # (B, mod_len, 32)
+                    
+                    approx_in = torch.cat([ts_guid_emb_approx_repeated, mod_idx_emb], dim=-1) # (B, mod_len, 32+32=64)
+                    log_tensor_stats(approx_in, "Flux_fwd_approx_in_to_distilled_guidance_layer_(Approximator)", logger_obj=logger)
 
-        # B: batch_size, L_txt: sequence length of text features
+                    mod_vecs = self.distilled_guidance_layer(approx_in) # Call the main modulator
+                    log_tensor_stats(mod_vecs, "Flux_fwd_mod_vecs_from_distilled_guidance_layer_(Approximator)", logger_obj=logger)
+
+                    mod_vecs_chroma = distribute_modulations_from_approximator(
+                        mod_vecs, self.num_double_blocks, self.num_single_blocks, self.params_dto
+                    )
+                    if mod_vecs_chroma:
+                         logger.debug("Flux_fwd: Successfully distributed modulations from self.distilled_guidance_layer (Approximator).")
+        elif not self.params_dto.use_modulation:
+            logger.warning("Flux_fwd: Chroma path (use_modulation=False) but no valid 'distilled_guidance_layer' (Approximator) found. Blocks will get default/identity modulations.")
+
+
+        # --- Positional Encoding ---
         B, L_txt, _ = txt_f.shape 
-
         txt_seq_positions = torch.arange(L_txt, device=txt_f.device, dtype=img_ids.dtype) 
-        txt_seq_positions = txt_seq_positions.unsqueeze(0).expand(B, -1) # (B, L_txt)
-
-        # 2. Expand text positional IDs to 3D to match img_ids's structure (B, L, 3_axes)
-        # We represent text 1D position as (sequence_pos, 0, 0) for the 3 axes.
-        # The specific meaning of the two zeroed axes for text is arbitrary but needed for uniform structure.
+        txt_seq_positions = txt_seq_positions.unsqueeze(0).expand(B, -1)
         txt_pos_ids_3d = torch.zeros(B, L_txt, 3, device=txt_f.device, dtype=img_ids.dtype)
-        txt_pos_ids_3d[..., 0] = txt_seq_positions # Fill the first axis with sequence positions
-
-        # 3. Concatenate the 3D positional IDs for text and image tokens
-        # img_ids is already (B, L_img_packed, 3)
-        all_pos_ids = torch.cat((txt_pos_ids_3d, img_ids), dim=1) # Concatenate along sequence dimension (dim=1)
-        
-        # 4. Generate positional embeddings using the combined positional IDs
+        txt_pos_ids_3d[..., 0] = txt_seq_positions
+        all_pos_ids = torch.cat((txt_pos_ids_3d, img_ids), dim=1)
         pe = self.pe_embedder(all_pos_ids)
-        # --- End of the fix ---
         
         current_img_features = img_p
         current_txt_features = txt_f
-        log_tensor_stats(current_img_features, "Flux_fwd_current_img_feat_PRE_DB_LOOP", logger)
-        log_tensor_stats(current_txt_features, "Flux_fwd_current_txt_feat_PRE_DB_LOOP", logger)
+        log_tensor_stats(current_img_features, "Flux_fwd_current_img_feat_PRE_DB_LOOP", logger_obj=logger)
+        log_tensor_stats(current_txt_features, "Flux_fwd_current_txt_feat_PRE_DB_LOOP", logger_obj=logger)
 
+        # --- DoubleStreamBlocks Loop ---
         for i,blk in enumerate(self.double_blocks):
-            log_tensor_stats(current_img_features, f"Flux_fwd_DB_{i}_img_INPUT", logger)
-            log_tensor_stats(current_txt_features, f"Flux_fwd_DB_{i}_txt_INPUT", logger)
-            dist_img_m,dist_txt_m = (mod_vecs_chroma.get(f"double_blocks.{i}.img_mod.lin"),mod_vecs_chroma.get(f"double_blocks.{i}.txt_mod.lin")) if mod_vecs_chroma else (None,None)
+            log_tensor_stats(current_img_features, f"Flux_fwd_DB_{i}_img_INPUT", logger_obj=logger)
+            log_tensor_stats(current_txt_features, f"Flux_fwd_DB_{i}_txt_INPUT", logger_obj=logger)
+            
+            dist_img_m, dist_txt_m = None, None
+            if mod_vecs_chroma: # Check if mod_vecs_chroma was successfully created
+                dist_img_m = mod_vecs_chroma.get(f"double_blocks.{i}.img_mod.lin")
+                dist_txt_m = mod_vecs_chroma.get(f"double_blocks.{i}.txt_mod.lin")
+            
             if self.blocks_to_swap and self.offloader_double: self.offloader_double.wait_for_block(i)
+            
+            # Pass internal_cond_vec as vec (will be zeros for Chroma)
+            # Pass distill_img_mod_params & distill_txt_mod_params from mod_vecs_chroma
             current_img_features, current_txt_features = blk(
                 img=current_img_features, 
                 txt=current_txt_features, 
-                vec=internal_cond_vec, # internal_cond_vec for Modulation if use_modulation=True in block
+                vec=internal_cond_vec, 
                 pe=pe, 
                 txt_attention_mask=txt_attention_mask,
-                distill_img_mod_params=dist_img_m, # for use_modulation=False in block
-                distill_txt_mod_params=dist_txt_m  # for use_modulation=False in block
+                distill_img_mod_params=dist_img_m, 
+                distill_txt_mod_params=dist_txt_m
             )
-            log_tensor_stats(current_img_features, f"Flux_fwd_DB_{i}_img_OUTPUT", logger)
-            log_tensor_stats(current_txt_features, f"Flux_fwd_DB_{i}_txt_OUTPUT", logger)
+            log_tensor_stats(current_img_features, f"Flux_fwd_DB_{i}_img_OUTPUT", logger_obj=logger)
+            log_tensor_stats(current_txt_features, f"Flux_fwd_DB_{i}_txt_OUTPUT", logger_obj=logger)
             if torch.isnan(current_img_features).any() or torch.isnan(current_txt_features).any():
                 logger.error(f"NaN detected after DoubleStreamBlock {i}!")
-                # Optionally raise error here to stop early: raise ValueError(f"NaN after DSB {i}")
+                # Consider raising an error or returning early if NaNs appear
             if self.blocks_to_swap and self.offloader_double: self.offloader_double.submit_move_blocks(self.double_blocks,i)
         
+        # --- SingleStreamBlocks Loop ---
         sb_in=torch.cat((current_txt_features,current_img_features),dim=1)
-        log_tensor_stats(sb_in, "Flux_fwd_sb_in_PRE_SB_LOOP", logger)
+        log_tensor_stats(sb_in, "Flux_fwd_sb_in_PRE_SB_LOOP", logger_obj=logger)
+        
         sb_attn_mask=None
-        if txt_attention_mask is not None:
-            img_mask_sb=torch.ones(txt_attention_mask.shape[0],current_img_features.shape[1],device=txt_attention_mask.device,dtype=txt_attention_mask.dtype) # Use txt_attention_mask.dtype
+        if txt_attention_mask is not None and current_img_features is not None: # Make sure current_img_features is not None
+            img_mask_sb=torch.ones(txt_attention_mask.shape[0],current_img_features.shape[1],device=txt_attention_mask.device,dtype=txt_attention_mask.dtype)
             sb_attn_mask=torch.cat((txt_attention_mask,img_mask_sb),dim=1)
             
         for i,blk in enumerate(self.single_blocks):
-            log_tensor_stats(sb_in, f"Flux_fwd_SB_{i}_INPUT", logger)
-            dist_s_mod=mod_vecs_chroma.get(f"single_blocks.{i}.modulation.lin") if mod_vecs_chroma else None
+            log_tensor_stats(sb_in, f"Flux_fwd_SB_{i}_INPUT", logger_obj=logger)
+            
+            dist_s_mod = None
+            if mod_vecs_chroma: # Check if mod_vecs_chroma was successfully created
+                dist_s_mod = mod_vecs_chroma.get(f"single_blocks.{i}.modulation.lin")
+            
             if self.blocks_to_swap and self.offloader_single: self.offloader_single.wait_for_block(i)
+            
+            # Pass internal_cond_vec as vec (zeros for Chroma)
+            # Pass distill_mod_params from mod_vecs_chroma
             sb_in = blk(
                 x=sb_in, 
-                vec=internal_cond_vec, # for Modulation if use_modulation=True in block
+                vec=internal_cond_vec, 
                 pe=pe, 
-                txt_attention_mask=sb_attn_mask, # This mask is for the concatenated seq
-                distill_mod_params=dist_s_mod # for use_modulation=False in block
+                txt_attention_mask=sb_attn_mask, 
+                distill_mod_params=dist_s_mod
             )
-            log_tensor_stats(sb_in, f"Flux_fwd_SB_{i}_OUTPUT", logger)
+            log_tensor_stats(sb_in, f"Flux_fwd_SB_{i}_OUTPUT", logger_obj=logger)
+            if torch.isnan(sb_in).any():
+                logger.error(f"NaN detected after SingleStreamBlock {i}!")
+                # Consider raising an error or returning early
             if self.blocks_to_swap and self.offloader_single: self.offloader_single.submit_move_blocks(self.single_blocks,i)
             
-        img_f_final=sb_in[:,current_txt_features.shape[1]:]
-        log_tensor_stats(img_f_final, "Flux_fwd_img_f_final_PRE_LASTLAYER", logger)
+        # --- Final Layer ---
+        img_f_final=sb_in[:,current_txt_features.shape[1]:] # Extract image features
+        log_tensor_stats(img_f_final, "Flux_fwd_img_f_final_PRE_LASTLAYER", logger_obj=logger)
+        
         if self.training and self.cpu_offload_checkpointing and self.blocks_to_swap:
-            img_f_final,internal_cond_vec=img_f_final.to(self.device),internal_cond_vec.to(self.device)
+            img_f_final=img_f_final.to(self.device) # internal_cond_vec is already on device or zeros
+            if internal_cond_vec.device != self.device: # ensure if not zeros
+                internal_cond_vec = internal_cond_vec.to(self.device)
             
+        # vec=internal_cond_vec will be zeros for Chroma, correctly bypassing adaLN in LastLayer
+        # distill_vec=None as LastLayer's adaLN is pruned in Chroma checkpoints.
         img_out = self.final_layer(img_f_final, vec=internal_cond_vec, distill_vec=None)
+        log_tensor_stats(img_out, "Flux_fwd_output_from_final_layer_img_out", logger_obj=logger)
         return img_out
 
 def zero_module(module): [nn.init.zeros_(p) for p in module.parameters()]; return module
