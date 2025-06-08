@@ -16,6 +16,9 @@ from PIL import Image
 import numpy as np
 from safetensors.torch import load_file
 
+_logging_configured = False
+_original_log_level = None
+
 def fire_in_thread(f, *args, **kwargs):
     threading.Thread(target=f, args=args, kwargs=kwargs).start()
 
@@ -27,7 +30,7 @@ def add_logging_arguments(parser):
     parser.add_argument(
         "--console_log_level",
         type=str,
-        default=None,
+        default=None, # Default to None, will fallback to INFO or forced DEBUG
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Set the logging level, default is INFO / ログレベルを設定する。デフォルトはINFO",
     )
@@ -40,60 +43,133 @@ def add_logging_arguments(parser):
     parser.add_argument("--console_log_simple", action="store_true", help="Simple log output / シンプルなログ出力")
 
 
-def setup_logging(args=None, log_level=None, reset=False):
-    if logging.root.handlers:
-        if reset:
-            # remove all handlers
-            for handler in logging.root.handlers[:]:
-                logging.root.removeHandler(handler)
-        else:
-            return
+def setup_logging(args=None, log_level_override=None, reset=False):
+    global _logging_configured, _original_log_level
 
-    # log_level can be set by the caller or by the args, the caller has priority. If not set, use INFO
-    if log_level is None and args is not None:
-        log_level = args.console_log_level
-    if log_level is None:
-        log_level = "INFO"
-    log_level = getattr(logging, log_level)
+    if _logging_configured and not reset:
+        # If already configured and not resetting, just ensure the level is what we want if overridden
+        if log_level_override:
+            current_level_val = getattr(logging, str(log_level_override).upper(), None)
+            if current_level_val is not None and logging.root.level != current_level_val:
+                # logging.getLogger(__name__).info(f"Re-adjusting log level to {log_level_override.upper()}")
+                logging.root.setLevel(current_level_val)
+                for handler_ H in logging.root.handlers: # Typo handler_ -> handler
+                    handler_.setLevel(current_level_val)
+        return
+
+    # Determine desired log level
+    if log_level_override:
+        log_level_str = str(log_level_override).upper()
+        if _original_log_level is None and args and args.console_log_level: # Store original only once
+             _original_log_level = args.console_log_level
+        elif _original_log_level is None:
+             _original_log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+    elif args and args.console_log_level:
+        log_level_str = args.console_log_level.upper()
+        _original_log_level = log_level_str # Store user preference
+    else:
+        log_level_str = os.environ.get("LOG_LEVEL", "INFO").upper()
+        _original_log_level = log_level_str # Store default preference
+
+    # --- FOR DIAGNOSIS: Force DEBUG if no override is given ---
+    # This allows you to easily switch back by setting `log_level_override` in your main script
+    # or by removing this forced section later.
+    if not log_level_override and not (args and args.console_log_level): # If not explicitly set by call or args
+        log_level_str = "DEBUG"
+        # logging.getLogger(__name__).info(f"No explicit log level, forcing DEBUG for diagnostics.")
+    # --- END FORCED DEBUG ---
+
+    log_level_val = getattr(logging, log_level_str, logging.INFO)
+
+
+    # Clear existing handlers from the root logger if resetting or first time
+    if reset or not _logging_configured:
+        for handler_R in logging.root.handlers[:]: # Typo handler_R -> handler
+            logging.root.removeHandler(handler_R)
+            # It's also good practice to close handlers if they have a close method
+            if hasattr(handler_R, 'close'):
+                handler_R.close()
+
 
     msg_init = None
-    if args is not None and args.console_log_file:
-        handler = logging.FileHandler(args.console_log_file, mode="w")
+    handler_to_add = None # Use a single variable for the chosen handler
+
+    if args and args.console_log_file:
+        handler_to_add = logging.FileHandler(args.console_log_file, mode="w")
+        # File handler usually doesn't need rich formatting
+        formatter = logging.Formatter(
+            fmt="%(asctime)s %(levelname)-8s %(name)-25s %(message)s (%(filename)s:%(lineno)d)",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
     else:
-        handler = None
         if not args or not args.console_log_simple:
             try:
                 from rich.logging import RichHandler
                 from rich.console import Console
-                from rich.logging import RichHandler
+                # from rich.logging import RichHandler # Duplicate import
 
-                handler = RichHandler(console=Console(stderr=True))
+                # Use a custom format string with rich for better alignment
+                handler_to_add = RichHandler(
+                    console=Console(stderr=True),
+                    show_time=True,
+                    show_level=True,
+                    show_path=True, # RichHandler handles path display
+                    markup=True, # Enable Rich markup
+                    log_time_format="[%Y-%m-%d %H:%M:%S]",
+                    # Example of rich format: rich_tracebacks=True, keywords for highlighting
+                )
+                # RichHandler has its own formatting, so a separate formatter might conflict or be ignored.
+                # For RichHandler, you often configure it directly.
+                # If you want to force a specific format string with RichHandler, it's more complex.
+                # For simplicity, let RichHandler use its defaults or slightly customized ones.
+                formatter = None # Let RichHandler manage formatting
+                msg_init = "Using Rich logging."
+
+
             except ImportError:
-                # print("rich is not installed, using basic logging")
-                msg_init = "rich is not installed, using basic logging"
+                msg_init = "rich is not installed, using basic StreamHandler logging"
 
-        if handler is None:
-            handler = logging.StreamHandler(sys.stdout)  # same as print
-            handler.propagate = False
+        if handler_to_add is None: # Fallback to basic StreamHandler
+            handler_to_add = logging.StreamHandler(sys.stdout) # stdout is often preferred for general logs
+            # handler_to_add.propagate = False # Not usually needed for root handlers
+            formatter = logging.Formatter( # Basic formatter
+                fmt="%(asctime)s %(levelname)-8s %(name)-25s %(message)s (%(filename)s:%(lineno)d)",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
 
-    formatter = logging.Formatter(
-        fmt="%(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    handler.setFormatter(formatter)
-    logging.root.setLevel(log_level)
-    logging.root.addHandler(handler)
+    if formatter: # If a formatter was created (i.e., not using RichHandler's default)
+        handler_to_add.setFormatter(formatter)
+
+    # Configure the root logger
+    logging.basicConfig(level=log_level_val, handlers=[handler_to_add], force=True)
+
+    # Ensure sub-loggers also respect the level if they were configured before basicConfig
+    logging.getLogger().setLevel(log_level_val) # Set level on the root logger itself
+    for existing_handler in logging.getLogger().handlers: # Also set level on its handlers
+        existing_handler.setLevel(log_level_val)
+
 
     if msg_init is not None:
-        logger = logging.getLogger(__name__)
-        logger.info(msg_init)
+        # Use a local logger for this util's messages to avoid early config issues
+        local_logger = logging.getLogger(__name__) # `__name__` will be 'library.utils'
+        local_logger.info(msg_init)
 
-setup_logging()
-logger = logging.getLogger(__name__)
+    # Test messages (use a local logger to ensure it's properly named)
+    test_logger = logging.getLogger("library.utils.test") # More specific name
+    test_logger.info(f"Logging has been set up. Level: {log_level_str} ({log_level_val}).")
+    test_logger.debug(f"This is a DEBUG test message from library.utils.setup_logging.")
 
-# endregion
+    _logging_configured = True
 
-# region PyTorch utils
+
+# Call setup_logging once at import time with no args to establish a default
+# This will use the forced DEBUG or environment variable if args are not yet parsed.
+# Subsequent calls from train_network.py with `args` can refine it if necessary.
+# However, we want the forced DEBUG for this run.
+setup_logging(log_level_override="DEBUG") # FORCE DEBUG for this session
+
+logger = logging.getLogger(__name__) # `__name__` will be 'library.util
 
 
 def swap_weight_devices(layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
