@@ -286,7 +286,7 @@ def flux1_schnell_params(depth_double=19, depth_single=38):
 def flux_chroma_params(depth_double=19, depth_single=38):
     return FluxParams(in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072,
         mlp_ratio=4.0, num_heads=24, depth=depth_double, depth_single_blocks=depth_single,
-        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True, guidance_embed=True,
+        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True, guidance_embed=False,
         use_modulation=False, use_distilled_guidance_layer=True, distilled_guidance_dim=5120,
         use_time_embed=False, use_vector_embed=False, 
         double_block_has_main_norms=False, # Chroma blocks do NOT have their own learnable norm parameters
