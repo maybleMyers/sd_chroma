@@ -836,6 +836,7 @@ class Flux(nn.Module):
         img_out = self.final_layer(img_f_final, distill_vec=final_mod_for_lastlayer)
         return img_out
 
+
 class ControlNetFlux(nn.Module):
     def __init__(self, params, controlnet_depth_mult = 1.0):
         super().__init__()
