@@ -713,31 +713,41 @@ class Flux(nn.Module):
     def __init__(self, params: FluxParams):
         super().__init__()
         self.params_dto = params
-        # ... other initializations (pe_embedder, img_in, txt_in, blocks) ...
-        self.pe_embedder=EmbedND(pe_dim,params.theta,params.axes_dim) # Assuming pe_dim is calculated correctly
+        self.in_channels = params.in_channels # Store in_channels
+        self.out_channels = params.in_channels # Store out_channels
+
+        # --- CALCULATE pe_dim (This was missing/commented out) ---
+        if params.hidden_size % params.num_heads != 0: 
+            raise ValueError(f"Hidden {params.hidden_size} not div by {params.num_heads}")
+        pe_dim = params.hidden_size // params.num_heads
+        if sum(params.axes_dim) != pe_dim: 
+            raise ValueError(f"axes_dim sum {sum(params.axes_dim)} != pe_dim {pe_dim}")
+        # --- END CALCULATE pe_dim ---
+
+        # These should come after pe_dim is defined
+        self.hidden_size = params.hidden_size # Store hidden_size
+        self.num_heads = params.num_heads # Store num_heads
+
+        self.pe_embedder=EmbedND(pe_dim,params.theta,params.axes_dim)
         self.img_in=nn.Linear(params.in_channels,params.hidden_size,True)
         self.txt_in=nn.Linear(params.context_in_dim,params.hidden_size,True)
 
         self.double_blocks=nn.ModuleList([DoubleStreamBlock(params.hidden_size,params.num_heads,params.mlp_ratio,params.qkv_bias,params.use_modulation,params.double_block_has_main_norms) for _ in range(params.depth)])
         self.single_blocks=nn.ModuleList([SingleStreamBlock(params.hidden_size,params.num_heads,params.mlp_ratio,params.use_modulation) for _ in range(params.depth_single_blocks)])
 
-
         # --- Chroma-Specific Component Initialization ---
         if not params.use_modulation: # This is the Chroma path
-            # Conditional components that are PRUNED in Chroma
-            self.time_in = None # Chroma doesn't use separate time_in MLP for internal_cond_vec
-            self.vector_in = None # Chroma doesn't use separate vector_in MLP for internal_cond_vec
-            self.guidance_in = nn.Identity() # Chroma doesn't use guidance_in MLP for internal_cond_vec
+            self.time_in = None
+            self.vector_in = None
+            self.guidance_in = nn.Identity() # Because flux_chroma_params sets guidance_embed=False
 
-            # Main modulator (Approximator)
-            # Its weights are expected under "distilled_guidance_layer.*" in the checkpoint
             if params.approximator_config:
                 app_cfg = params.approximator_config
-                # Ensure out_dim_per_mod_vector is set correctly if it's 0
                 out_dim_for_approx = app_cfg.out_dim_per_mod_vector if app_cfg.out_dim_per_mod_vector != 0 else params.hidden_size
                 
+                # This is the main modulator for Chroma, weights expected under "distilled_guidance_layer.*"
                 self.distilled_guidance_layer = Approximator(
-                    app_cfg.in_dim, out_dim_for_approx, app_cfg.hidden_dim, app_cfg.n_layers # n_layers is now 5
+                    app_cfg.in_dim, out_dim_for_approx, app_cfg.hidden_dim, app_cfg.n_layers
                 )
                 self.register_buffer('mod_index', torch.arange(app_cfg.mod_index_length), persistent=False)
                 self.mod_index_length = app_cfg.mod_index_length
@@ -746,33 +756,25 @@ class Flux(nn.Module):
                 self.distilled_guidance_layer = None
                 logger.error("Chroma Path: Approximator config missing, cannot create distilled_guidance_layer (Approximator).")
 
-            # Image feature enhancement (FeatureFusionDistiller) - if used by your Chroma setup
-            # The official `Chroma` class does not seem to have this in addition to the main Approximator.
-            # If `params.use_distilled_guidance_layer` was meant *only* for the main Approximator,
-            # then this FFD should be None for pure Chroma alignment.
-            # Let's assume for now it's a separate potential enhancement.
+            # Optional image feature enhancer
             self.img_p_enhancer_module = FeatureFusionDistiller(
                 params.in_channels, params.distilled_guidance_dim, params.hidden_size
-            ) if params.use_distilled_guidance_layer else None # NOTE: Name distinct from the Approximator
+            ) if params.use_distilled_guidance_layer else None
             if self.img_p_enhancer_module:
                  logger.info("Chroma Path: Initialized self.img_p_enhancer_module as FeatureFusionDistiller.")
+            
+            self.modulation_approximator = None # Explicitly None for Chroma path
 
-
-            # Ensure the attribute that was previously causing issues is None
-            self.modulation_approximator = None
-
-        else: # Dev/Schnell Path (internal modulation)
+        else: # Dev/Schnell Path
             self.time_in = MLPEmbedder(256, params.hidden_size) if params.use_time_embed else None
             self.vector_in = MLPEmbedder(params.vec_in_dim, params.hidden_size) if params.use_vector_embed else None
             self.guidance_in = MLPEmbedder(256, params.hidden_size) if params.guidance_embed else nn.Identity()
             
-            self.distilled_guidance_layer = None # Not used by Dev/Schnell for block modulation
-            self.img_p_enhancer_module = None # Not used by Dev/Schnell
-            self.modulation_approximator = None # Not used by Dev/Schnell (they use internal Modulation layers)
+            self.distilled_guidance_layer = None 
+            self.img_p_enhancer_module = None
+            self.modulation_approximator = None
 
-        # Final Layer - common structure, but adaLN part is pruned for Chroma
         self.final_layer = LastLayer(params.hidden_size, 1, self.out_channels)
-        # No need for self.final_layer_custom_path, LastLayer's forward handles vec=None or vec=zeros
 
         self.gradient_checkpointing=False; self.cpu_offload_checkpointing=False; self.blocks_to_swap=None
         self.offloader_double=None; self.offloader_single=None
