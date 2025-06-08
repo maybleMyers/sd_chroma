@@ -622,11 +622,5 @@ def add_flux_train_arguments(parser: argparse.ArgumentParser):
     parser.add_argument("--sigmoid_scale", type=float, default=1.0, help="Scale for sigmoid/shift timestep sampling")
     parser.add_argument("--model_prediction_type", choices=["raw", "additive", "sigma_scaled"], default="raw", help="Model prediction interpretation (raw means model predicts (noise - x0))")
     parser.add_argument("--discrete_flow_shift", type=float, default=3.0, help="Discrete flow shift for Euler Discrete Scheduler (shift sampling)")
-    # Args for SD3-style sampling/weighting (logit_normal, mode, cosmap)
-    parser.add_argument("--logit_mean", type=float, default=0.0, help="Mean for logit_normal timestep sampling")
-    parser.add_argument("--logit_std", type=float, default=1.0, help="Std for logit_normal timestep sampling")
-    parser.add_argument("--mode_scale", type=float, default=1.0, help="Scale for mode timestep sampling")
-    parser.add_argument("--weighting_scheme", choices=["sigma_sqrt", "cosmap", "none"], default="sigma_sqrt", help="Loss weighting for SD3-style sampling")
-
     # Chroma SOT Loss Flag
     parser.add_argument("--use_chroma_sot_loss", action="store_true", help="Use Chroma-specific Stochastic Optimal Transport loss. Overrides some timestep/loss args.")
