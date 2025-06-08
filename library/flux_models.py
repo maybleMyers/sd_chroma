@@ -801,15 +801,21 @@ class Flux(nn.Module):
         # img_ids: (B, L_img_packed, 3), positional IDs for image tokens
         # txt: (B, L_txt_seq, D_t5), T5 feature outputs
         # txt_ids: (B, L_txt_seq), T5 vocabulary token IDs (THIS IS THE ONE MISUSED FOR pe_embedder)
-
+        log_tensor_stats(img, "Flux_fwd_SOT_noisy_input_packed", logger)
         if img.ndim != 3 or txt.ndim != 3: # txt is (B, L, D), img is (B, L, D)
             raise ValueError(f"Inputs img/txt must be 3D. Got img: {img.ndim}D, txt: {txt.ndim}D")
             
         img_p = self.img_in(img)
-        if self.distilled_guidance_layer: img_p = img_p + self.distilled_guidance_layer(img)
+        log_tensor_stats(img_p, "Flux_fwd_after_img_in", logger)
+        if self.distilled_guidance_layer: 
+            dist_guid_out = self.distilled_guidance_layer(img) # Assuming img is the input to this as per official
+            log_tensor_stats(dist_guid_out, "Flux_fwd_after_distilled_guidance_layer_out", logger)
+            img_p = img_p + dist_guid_out # Add, not replace
+            log_tensor_stats(img_p, "Flux_fwd_img_p_after_dist_guid_add", logger)
         
         txt_f = self.txt_in(txt) # txt_f is (B, L_txt_seq, D_hidden)
-        
+        log_tensor_stats(txt_f, "Flux_fwd_after_txt_in", logger)
+
         int_cond_parts=[]
         if self.time_in: int_cond_parts.append(self.time_in(timestep_embedding(timesteps,256)))
         if self.params_dto.guidance_embed and guidance is not None and not isinstance(self.guidance_in,nn.Identity):
@@ -854,26 +860,53 @@ class Flux(nn.Module):
         
         current_img_features = img_p
         current_txt_features = txt_f
+        log_tensor_stats(current_img_features, "Flux_fwd_current_img_feat_PRE_DB_LOOP", logger)
+        log_tensor_stats(current_txt_features, "Flux_fwd_current_txt_feat_PRE_DB_LOOP", logger)
 
         for i,blk in enumerate(self.double_blocks):
+            log_tensor_stats(current_img_features, f"Flux_fwd_DB_{i}_img_INPUT", logger)
+            log_tensor_stats(current_txt_features, f"Flux_fwd_DB_{i}_txt_INPUT", logger)
             dist_img_m,dist_txt_m = (mod_vecs_chroma.get(f"double_blocks.{i}.img_mod.lin"),mod_vecs_chroma.get(f"double_blocks.{i}.txt_mod.lin")) if mod_vecs_chroma else (None,None)
             if self.blocks_to_swap and self.offloader_double: self.offloader_double.wait_for_block(i)
-            current_img_features,current_txt_features=blk(current_img_features,current_txt_features,internal_cond_vec,pe,txt_attention_mask,dist_img_m,dist_txt_m)
+            current_img_features, current_txt_features = blk(
+                img=current_img_features, 
+                txt=current_txt_features, 
+                vec=internal_cond_vec, # internal_cond_vec for Modulation if use_modulation=True in block
+                pe=pe, 
+                txt_attention_mask=txt_attention_mask,
+                distill_img_mod_params=dist_img_m, # for use_modulation=False in block
+                distill_txt_mod_params=dist_txt_m  # for use_modulation=False in block
+            )
+            log_tensor_stats(current_img_features, f"Flux_fwd_DB_{i}_img_OUTPUT", logger)
+            log_tensor_stats(current_txt_features, f"Flux_fwd_DB_{i}_txt_OUTPUT", logger)
+            if torch.isnan(current_img_features).any() or torch.isnan(current_txt_features).any():
+                logger.error(f"NaN detected after DoubleStreamBlock {i}!")
+                # Optionally raise error here to stop early: raise ValueError(f"NaN after DSB {i}")
             if self.blocks_to_swap and self.offloader_double: self.offloader_double.submit_move_blocks(self.double_blocks,i)
-            
+        
         sb_in=torch.cat((current_txt_features,current_img_features),dim=1)
+        log_tensor_stats(sb_in, "Flux_fwd_sb_in_PRE_SB_LOOP", logger)
         sb_attn_mask=None
         if txt_attention_mask is not None:
             img_mask_sb=torch.ones(txt_attention_mask.shape[0],current_img_features.shape[1],device=txt_attention_mask.device,dtype=txt_attention_mask.dtype) # Use txt_attention_mask.dtype
             sb_attn_mask=torch.cat((txt_attention_mask,img_mask_sb),dim=1)
             
         for i,blk in enumerate(self.single_blocks):
+            log_tensor_stats(sb_in, f"Flux_fwd_SB_{i}_INPUT", logger)
             dist_s_mod=mod_vecs_chroma.get(f"single_blocks.{i}.modulation.lin") if mod_vecs_chroma else None
             if self.blocks_to_swap and self.offloader_single: self.offloader_single.wait_for_block(i)
-            sb_in=blk(sb_in,internal_cond_vec,pe,sb_attn_mask,dist_s_mod)
+            sb_in = blk(
+                x=sb_in, 
+                vec=internal_cond_vec, # for Modulation if use_modulation=True in block
+                pe=pe, 
+                txt_attention_mask=sb_attn_mask, # This mask is for the concatenated seq
+                distill_mod_params=dist_s_mod # for use_modulation=False in block
+            )
+            log_tensor_stats(sb_in, f"Flux_fwd_SB_{i}_OUTPUT", logger)
             if self.blocks_to_swap and self.offloader_single: self.offloader_single.submit_move_blocks(self.single_blocks,i)
             
         img_f_final=sb_in[:,current_txt_features.shape[1]:]
+        log_tensor_stats(img_f_final, "Flux_fwd_img_f_final_PRE_LASTLAYER", logger)
         if self.training and self.cpu_offload_checkpointing and self.blocks_to_swap:
             img_f_final,internal_cond_vec=img_f_final.to(self.device),internal_cond_vec.to(self.device)
             
