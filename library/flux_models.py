@@ -8,11 +8,11 @@ import math
 import os
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union, Tuple, TYPE_CHECKING 
-import logging 
+from dataclasses import dataclass, field # Added field for default_factory
+from typing import Any, Dict, List, Optional, Union, Tuple, TYPE_CHECKING
+import logging
 
-from library import utils
+from library import utils # Assuming this is your utils.py for setup_logging
 from library.device_utils import clean_memory_on_device, init_ipex
 
 init_ipex()
@@ -20,54 +20,22 @@ init_ipex()
 import torch
 from einops import rearrange
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
+import torch.nn.functional as F # Added for F.rms_norm
+from torch.utils.checkpoint import checkpoint as torch_checkpoint # Renamed to avoid conflict
 
-from library import custom_offloading_utils
+from library import custom_offloading_utils # Keep if block swapping is still desired
+from .math import attention, rope
 
-
-logger = logging.getLogger(__name__) 
+logger = logging.getLogger(__name__)
 
 # from library import flux_models # Removed self-import
-from library.utils import load_safetensors 
+from library.utils import load_safetensors
 
 if TYPE_CHECKING:
     pass
 
 
-@dataclass
-class ApproximatorParams:
-    in_dim: int = 64
-    out_dim_per_mod_vector: int = 0 
-    hidden_dim: int = 5120 
-    n_layers: int = 5
-    mod_index_length: int = 344 
-
-@dataclass
-class FluxParams:
-    in_channels: int
-    vec_in_dim: int
-    context_in_dim: int
-    hidden_size: int 
-    mlp_ratio: float
-    num_heads: int   
-    depth: int  
-    depth_single_blocks: int 
-    axes_dim: list[int]
-    theta: int
-    qkv_bias: bool         
-    guidance_embed: bool   
-    use_modulation: bool   # True for Schnell/Dev, False for Chroma (external mod)
-    use_distilled_guidance_layer: bool # For Chroma's feature_fusion_distiller layer
-    distilled_guidance_dim: int = 5120 
-    use_time_embed: bool = True      
-    use_vector_embed: bool = True    
-    # If True, DoubleStreamBlocks have their main LayerNorms with learnable params if use_modulation=False
-    # If False, these norms might be nn.Identity() or non-affine.
-    double_block_has_main_norms: bool = True 
-    approximator_config: Optional[ApproximatorParams] = None
-
-
-# region autoencoder
+# region autoencoder - Kept from original, assumed compatible
 
 
 @dataclass
@@ -251,165 +219,14 @@ class AutoEncoder(nn.Module):
     def forward(self, x: Tensor) -> Tensor: return self.decode(self.encode(x))
 
 # endregion
-# region config
 
-@dataclass
-class ModelSpec:
-    params: Union[FluxParams, Dict]
-    ae_params: AutoEncoderParams
-    ckpt_path: str | None
-    ae_path: str | None
 
-_original_configs_for_ae = {
-    "dev": ModelSpec(ckpt_path=None, params={}, ae_path=None, ae_params=AutoEncoderParams(
-        resolution=256, in_channels=3, ch=128, out_ch=3, ch_mult=[1, 2, 4, 4],
-        num_res_blocks=2, z_channels=16, scale_factor=0.3611, shift_factor=0.1159)),
-    "schnell": ModelSpec(ckpt_path=None, params={}, ae_path=None, ae_params=AutoEncoderParams(
-        resolution=256, in_channels=3, ch=128, out_ch=3, ch_mult=[1, 2, 4, 4],
-        num_res_blocks=2, z_channels=16, scale_factor=0.3611, shift_factor=0.1159)),
-}
-
-def flux1_dev_params(depth_double=19, depth_single=38):
-    return FluxParams(in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072,
-        mlp_ratio=4.0, num_heads=24, depth=depth_double, depth_single_blocks=depth_single,
-        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True, guidance_embed=True, 
-        use_modulation=True, use_distilled_guidance_layer=False, use_time_embed=True, 
-        use_vector_embed=True, double_block_has_main_norms=True)
-
-def flux1_schnell_params(depth_double=19, depth_single=38):
-    return FluxParams(in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072,
-        mlp_ratio=4.0, num_heads=24, depth=depth_double, depth_single_blocks=depth_single,
-        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True, guidance_embed=False, 
-        use_modulation=True, use_distilled_guidance_layer=False, use_time_embed=True, 
-        use_vector_embed=True, double_block_has_main_norms=True)
-
-def flux_chroma_params(depth_double=19, depth_single=38):
-    return FluxParams(in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072,
-        mlp_ratio=4.0, num_heads=24, depth=depth_double, depth_single_blocks=depth_single,
-        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True, guidance_embed=False,
-        use_modulation=False, use_distilled_guidance_layer=True, distilled_guidance_dim=5120,
-        use_time_embed=False, use_vector_embed=False, 
-        double_block_has_main_norms=False, # Chroma blocks do NOT have their own learnable norm parameters
-        approximator_config=ApproximatorParams(in_dim=64, out_dim_per_mod_vector=3072,
-            hidden_dim=5120, n_layers=4, mod_index_length=344))
-
-model_configs = {
-    "dev": ModelSpec(params=flux1_dev_params(), ae_params=_original_configs_for_ae["dev"].ae_params, ckpt_path=None, ae_path=None),
-    "schnell": ModelSpec(params=flux1_schnell_params(), ae_params=_original_configs_for_ae["schnell"].ae_params, ckpt_path=None, ae_path=None),
-    "chroma": ModelSpec(params=flux_chroma_params(), ae_params=_original_configs_for_ae["schnell"].ae_params, ckpt_path=None, ae_path=None)
-}
-
-# endregion
-# region math
-
-def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor, attn_mask: Optional[Tensor] = None) -> Tensor:
-    q, k = apply_rope(q, k, pe)
-    x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-    return rearrange(x, "B H L D -> B L (H D)")
-
-def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
-    assert dim % 2 == 0
-    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
-    omega = 1.0 / (theta**scale)
-    out = torch.einsum("...n,d->...nd", pos, omega)
-    out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
-    return rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2).float()
-
-def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
-    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
-    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
-    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
-    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
-
-# endregion
-# region layers
-
-def to_cuda(x): 
-    if isinstance(x, torch.Tensor): return x.cuda()
-    if isinstance(x, (list, tuple)): return [to_cuda(elem) for elem in x]
-    if isinstance(x, dict): return {k: to_cuda(v) for k, v in x.items()}
-    return x
-
-def to_cpu(x): 
-    if isinstance(x, torch.Tensor): return x.cpu()
-    if isinstance(x, (list, tuple)): return [to_cpu(elem) for elem in x]
-    if isinstance(x, dict): return {k: to_cpu(v) for k, v in x.items()}
-    return x
-
-class EmbedND(nn.Module):
-    def __init__(self, dim: int, theta: int, axes_dim: list[int]):
-        super().__init__(); self.dim, self.theta, self.axes_dim = dim, theta, axes_dim
-    def forward(self, ids: Tensor) -> Tensor:
-        n_axes = ids.shape[-1]
-        emb = torch.cat([rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)], dim=-3)
-        return emb.unsqueeze(1)
-
-def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
-    original_shape = t.shape
-    if t.ndim > 1: t = t.reshape(-1) 
-    t_scaled = time_factor * t
-    half = dim // 2
-    freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half).to(t.device)
-    args = t_scaled[:, None].float() * freqs[None]
-    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2: embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-    if len(original_shape) > 1 and embedding.shape[0] == original_shape[0] * original_shape[1]:
-        embedding = embedding.view(*original_shape, dim)
-    original_t_dtype = t.dtype if t.ndim == 1 and original_shape == t.shape else t_scaled.dtype
-    if torch.is_floating_point(t_scaled): embedding = embedding.to(original_t_dtype)
-    return embedding
-
-class MLPEmbedder(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int):
-        super().__init__()
-        self.in_layer = nn.Linear(in_dim, hidden_dim, bias=True)
-        self.silu = nn.SiLU()
-        self.out_layer = nn.Linear(hidden_dim, hidden_dim, bias=True)
-        self.gradient_checkpointing = False
-    def enable_gradient_checkpointing(self): self.gradient_checkpointing = True
-    def disable_gradient_checkpointing(self): self.gradient_checkpointing = False
-    def _forward(self, x: Tensor) -> Tensor: return self.out_layer(self.silu(self.in_layer(x)))
-    def forward(self, *args, **kwargs):
-        if self.training and self.gradient_checkpointing:
-            return checkpoint(self._forward, *args, use_reentrant=False, **kwargs)
-        return self._forward(*args, **kwargs)
-
-class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int):
-        super().__init__(); self.scale = nn.Parameter(torch.ones(dim))
-    def forward(self, x: Tensor):
-        x_dtype = x.dtype; x = x.float()
-        rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
-        return ((x * rrms) * self.scale.float()).to(dtype=x_dtype)
-
-class QKNorm(torch.nn.Module):
-    def __init__(self, dim: int):
-        super().__init__(); self.query_norm, self.key_norm = RMSNorm(dim), RMSNorm(dim)
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
-        return self.query_norm(q).to(v), self.key_norm(k).to(v)
-
-class SelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False):
-        super().__init__(); self.num_heads = num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.norm = QKNorm(dim // num_heads)
-        self.proj = nn.Linear(dim, dim)
-    def forward(self, x: Tensor, pe: Tensor) -> Tensor:
-        qkv = self.qkv(x)
-        q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
-        q, k = self.norm(q, k, v)
-        x = attention(q, k, v, pe=pe); return self.proj(x)
-
-@dataclass
-class ModulationOut: shift: Tensor; scale: Tensor; gate: Tensor
+# --- Helper for logging tensor stats (from original file) ---
 def log_tensor_stats(tensor: Optional[torch.Tensor], name: str = "tensor", logger_obj: Optional[logging.Logger] = None):
-    """Logs statistics of a tensor if it's not None."""
     if logger_obj is None:
-        logger_obj = logging.getLogger(__name__) # Fallback to current module's logger
+        logger_obj = logging.getLogger(__name__)
 
     if tensor is not None:
-        # Ensure operations are safe even for 0-element tensors if they can occur
         has_elements = tensor.numel() > 0
         min_val = tensor.min().item() if has_elements else 'N/A (0 elements)'
         max_val = tensor.max().item() if has_elements else 'N/A (0 elements)'
@@ -425,474 +242,557 @@ def log_tensor_stats(tensor: Optional[torch.Tensor], name: str = "tensor", logge
     else:
         logger_obj.debug(f"{name}: None")
 
-class Modulation(nn.Module):
-    def __init__(self, dim: int, double: bool):
-        super().__init__(); self.is_double, self.multiplier = double, 6 if double else 3
-        self.lin = nn.Linear(dim, self.multiplier * dim, bias=True)
-    def forward(self, vec: Tensor) -> tuple[ModulationOut, ModulationOut | None]:
-        out = self.lin(nn.functional.silu(vec))[:, None, :].chunk(self.multiplier, dim=-1)
-        return (ModulationOut(*out[:3]), ModulationOut(*out[3:]) if self.is_double else None)
 
-class LastLayer(nn.Module):
-    def __init__(self, hidden_size: int, patch_size: int, out_channels: int):
+# --- Official Chroma Math Utils ---
+def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
+    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
+    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
+    xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
+    xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
+    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+
+def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
+    assert dim % 2 == 0
+    scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
+    omega = 1.0 / (theta**scale)
+    out = torch.einsum("...n,d->...nd", pos, omega)
+    out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
+    out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
+    return out.float()
+
+def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor, mask: Optional[Tensor]=None) -> Tensor:
+    q, k = apply_rope(q, k, pe)
+    x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    x = rearrange(x, "B H L D -> B L (H D)")
+    return x
+# --- End Official Chroma Math Utils ---
+
+
+# --- Official Chroma Layer Definitions ---
+class EmbedND(nn.Module):
+    def __init__(self, dim: int, theta: int, axes_dim: list[int]):
         super().__init__()
-        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6) # Non-affine as per original
-        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-        # adaLN_modulation is present but will be unused by Chroma if vec is None and distill_vec is used for shift/scale only
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
-    
-    def forward(self, x: Tensor, vec: Optional[Tensor] = None, distill_vec: Optional[List[Tensor]] = None) -> Tensor:
-        # For Chroma, vec will be effectively zero if its inputs (time_in, vector_in) are None.
-        # distill_vec is not used by Chroma's final_layer path.
-        # The `final_layer_custom_path` in Flux class for Chroma bypasses this LastLayer's adaLN part.
-        # If Flux `final_layer_custom_path` is False (e.g. for Dev/Schnell), then vec is used.
-        
-        log_tensor_stats(x, "LastLayer_input_x", logger_obj=logger) # Use your log_tensor_stats helper
-        x_normed = self.norm_final(x)
-        log_tensor_stats(x_normed, "LastLayer_x_normed", logger_obj=logger)
+        self.dim = dim
+        self.theta = theta
+        self.axes_dim = axes_dim
 
-        if vec is not None and not (vec.ndim == 3 and vec.shape[1] == 1 and vec.shape[2] == self.adaLN_modulation[1].in_features and torch.all(vec == 0)):
-            mod_out = self.adaLN_modulation(vec)
-            shift, scale = mod_out.chunk(2, dim=1)
-            shift, scale = shift.unsqueeze(1), scale.unsqueeze(1)
-            x_mod = (1 + scale) * x_normed + shift
-            log_tensor_stats(x_mod, "LastLayer_x_mod_with_adaLN", logger_obj=logger)
-        else:
-            x_mod = x_normed
-            log_tensor_stats(x_mod, "LastLayer_x_mod_no_adaLN", logger_obj=logger) # Should be float32, non-NaN
+    def forward(self, ids: Tensor) -> Tensor:
+        n_axes = ids.shape[-1]
+        emb = torch.cat(
+            [rope(ids[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)],
+            dim=-3,
+        )
+        return emb.unsqueeze(1)
 
-        log_tensor_stats(self.linear.weight, "LastLayer_self.linear.weight", logger_obj=logger)
-        if self.linear.bias is not None:
-            log_tensor_stats(self.linear.bias, "LastLayer_self.linear.bias", logger_obj=logger)
-        
-        x_out = self.linear(x_mod) # x_mod is float32, self.linear.weight is bf16. Autocast should handle this.
-                                   # Expected: x_mod cast to bf16, matmul in bf16, output bf16.
-        log_tensor_stats(x_out, "LastLayer_x_out_FINAL", logger_obj=logger)
-        return x_out
+def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
+    original_shape = t.shape
+    if t.ndim == 0:
+        t = t.unsqueeze(0)
+    elif t.ndim > 1 and t.numel() == t.shape[0]*t.shape[1]:
+        t = t.reshape(-1)
+    elif t.ndim > 1:
+        t = t.reshape(-1)
 
-class ApproximatorLayer(nn.Module): # To match Ostris/Chroma checkpoint keys
-    def __init__(self, hidden_dim: int):
+
+    t_scaled = time_factor * t
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period)
+        * torch.arange(start=0, end=half, dtype=torch.float32)
+        / half
+    ).to(t_scaled.device)
+
+    args = t_scaled[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+
+    if len(original_shape) > 1 and embedding.shape[0] == original_shape[0] * original_shape[1] and original_shape[0] != 0 and original_shape[1] != 0:
+        embedding = embedding.view(*original_shape, dim)
+    elif len(original_shape) == 1 and original_shape[0] == 0:
+        embedding = torch.empty(*original_shape, dim, device=embedding.device, dtype=embedding.dtype)
+
+    return embedding.float()
+
+
+class MLPEmbedder(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int):
         super().__init__()
-        self.in_layer = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.in_layer = nn.Linear(in_dim, hidden_dim, bias=True)
+        self.silu = nn.SiLU()
         self.out_layer = nn.Linear(hidden_dim, hidden_dim, bias=True)
-        self.act = nn.SiLU() # Or GELU if preferred for approximator MLP
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.out_layer(self.act(self.in_layer(x)))
+    @property
+    def device(self): return next(self.parameters()).device
+    def forward(self, x: Tensor) -> Tensor: return self.out_layer(self.silu(self.in_layer(x)))
+
+
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, use_compiled: bool = False):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(dim))
+        
+    def forward(self, x: Tensor):
+        if hasattr(F, "rms_norm"):
+            return F.rms_norm(x, self.scale.shape, weight=self.scale, eps=1e-6)
+        else:
+            x_dtype = x.dtype
+            x = x.float()
+            rrms = torch.rsqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
+            return ((x * rrms) * self.scale.float()).to(dtype=x_dtype)
+
+
+@dataclass
+class ModulationOut:
+    shift: Tensor
+    scale: Tensor
+    gate: Tensor
+
+def distribute_modulations(tensor: torch.Tensor, num_double_blocks: int, num_single_blocks: int, final_layer_mod: bool = True) -> Dict[str, Any]:
+    batch_size, total_vectors, dim_per_vector = tensor.shape
+    block_dict = {}
+    idx = 0
+
+    expected_vectors = (num_double_blocks * 2 * 3) + (num_double_blocks * 2 * 3) + \
+                       (num_single_blocks * 1 * 3)
+    if final_layer_mod:
+        expected_vectors += 2
+
+    if total_vectors < expected_vectors:
+        logger.warning(f"distribute_modulations: Not enough vectors. Have {total_vectors}, need {expected_vectors}. Modulation might be incomplete.")
+
+    def _get_slice(num_vecs_needed):
+        nonlocal idx
+        end_idx = idx + num_vecs_needed
+        if end_idx > total_vectors:
+            if num_vecs_needed == 3:
+                s = torch.zeros(batch_size, 1, dim_per_vector, device=tensor.device, dtype=tensor.dtype)
+                sc = torch.zeros(batch_size, 1, dim_per_vector, device=tensor.device, dtype=tensor.dtype)
+                g = torch.ones(batch_size, 1, dim_per_vector, device=tensor.device, dtype=tensor.dtype)
+                return s, sc, g
+            elif num_vecs_needed == 2:
+                s = torch.zeros(batch_size, 1, dim_per_vector, device=tensor.device, dtype=tensor.dtype)
+                sc = torch.zeros(batch_size, 1, dim_per_vector, device=tensor.device, dtype=tensor.dtype)
+                return s, sc
+            else:
+                return [torch.zeros(batch_size, 1, dim_per_vector, device=tensor.device, dtype=tensor.dtype)] * num_vecs_needed
+        
+        slices = [tensor[:, i:i+1, :] for i in range(idx, end_idx)]
+        idx = end_idx
+        return slices[0], slices[1], slices[2] if num_vecs_needed == 3 else (slices[0], slices[1])
+
+
+    for i in range(num_single_blocks):
+        key = f"single_blocks.{i}.modulation.lin"
+        s, sc, g = _get_slice(3)
+        block_dict[key] = ModulationOut(shift=s, scale=sc, gate=g)
+
+    for i in range(num_double_blocks):
+        key_img = f"double_blocks.{i}.img_mod.lin"
+        key_txt = f"double_blocks.{i}.txt_mod.lin"
+        
+        img_mods_block = []
+        for _ in range(2):
+            s, sc, g = _get_slice(3)
+            img_mods_block.append(ModulationOut(shift=s, scale=sc, gate=g))
+        block_dict[key_img] = img_mods_block
+
+        txt_mods_block = []
+        for _ in range(2):
+            s, sc, g = _get_slice(3)
+            txt_mods_block.append(ModulationOut(shift=s, scale=sc, gate=g))
+        block_dict[key_txt] = txt_mods_block
+        
+    if final_layer_mod:
+        key_final = "final_layer.adaLN_modulation.1"
+        s, sc = _get_slice(2)
+        block_dict[key_final] = [s, sc]
+
+    if idx > total_vectors:
+        logger.error(f"distribute_modulations: Overran vectors. Index {idx}, total {total_vectors}")
+    elif idx < expected_vectors and total_vectors >= expected_vectors :
+        logger.warning(f"distribute_modulations: Underran expected vectors. Index {idx}, expected {expected_vectors}")
+
+
+    return block_dict
+
 
 class Approximator(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden_dim: int, n_layers=4):
         super().__init__()
         self.in_proj = nn.Linear(in_dim, hidden_dim, bias=True)
-        # To match `layers.X.in_layer` and `layers.X.out_layer` from analyze_model_keys
-        self.layers = nn.ModuleList([ApproximatorLayer(hidden_dim) for _ in range(n_layers)])
+        self.layers = nn.ModuleList(
+            [MLPEmbedder(hidden_dim, hidden_dim) for _ in range(n_layers)]
+        )
         self.norms = nn.ModuleList([RMSNorm(hidden_dim) for _ in range(n_layers)])
         self.out_proj = nn.Linear(hidden_dim, out_dim)
 
-    def forward(self, x: Tensor) -> Tensor: 
-        x = self.in_proj(x)
-        for i, layer_group in enumerate(self.layers): # layer_group is ApproximatorLayer
-            x_normed = self.norms[i](x)
-            x = x + layer_group(x_normed) # Residual connection around norm + ApproximatorLayer
-        return self.out_proj(x)
-
-
-def distribute_modulations_from_approximator(
-    mod_vectors: Tensor, num_double_blocks: int, num_single_blocks: int, flux_params: FluxParams
-) -> Dict[str, Any]:
-    mod_dict = {}; B, L_mod, H_mod = mod_vectors.shape
-    dev, dtype = mod_vectors.device, mod_vectors.dtype
-    
-    # For Chroma (use_modulation=False), the number of vectors needed by blocks (excluding final layer)
-    # is (num_double_blocks * 2 for img_mod + num_double_blocks * 2 for txt_mod) + (num_single_blocks * 1 for single_mod)
-    # Each "mod" (img_mod, txt_mod, single_mod) itself needs 3 vectors from the approximator (shift, scale, gate).
-    expected_vecs_for_blocks = (num_double_blocks * 2 * 3) + (num_double_blocks * 2 * 3) + (num_single_blocks * 1 * 3)
-    # Final layer for Chroma if not custom_path uses LastLayer, which takes adaLN from `vec`.
-    # If `final_layer_custom_path` is True, this part is not used.
-    # If `final_layer_custom_path` is False, LastLayer's adaLN_modulation (if vec is not zero) needs 2 vectors (shift, scale).
-    # However, Chroma's `flux_chroma_params` makes `final_layer_custom_path=True`, so we don't need vectors for final_layer from approximator.
-
-    expected_total_vecs = expected_vecs_for_blocks
-    
-    if L_mod != flux_params.approximator_config.mod_index_length or L_mod < expected_total_vecs:
-         logger.warning(f"Approximator produced {L_mod} mod vectors, mod_index_length is {flux_params.approximator_config.mod_index_length}, expected at least {expected_total_vecs} for blocks.")
-
-    current_idx = 0
-    def _get_mod_out():
-        nonlocal current_idx
-        if current_idx + 2 >= L_mod: # Need 3 vectors
-            # logger.warning(f"Not enough mod_vectors from approximator for a block component. Requested 3 from {current_idx}, have {L_mod}. Returning zeros.")
-            s = torch.zeros(B, 1, H_mod, device=dev, dtype=dtype)
-            sc = torch.zeros(B, 1, H_mod, device=dev, dtype=dtype) 
-            g = torch.ones(B, 1, H_mod, device=dev, dtype=dtype)   
-            # Don't advance current_idx if we are returning zeros due to insufficient vectors
-            return ModulationOut(s, sc, g)
-        
-        shift = mod_vectors[:, current_idx, :].unsqueeze(1)
-        scale = mod_vectors[:, current_idx + 1, :].unsqueeze(1)
-        gate = mod_vectors[:, current_idx + 2, :].unsqueeze(1)
-        current_idx += 3
-        return ModulationOut(shift, scale, gate)
-
-    for i in range(num_double_blocks):
-        mod_dict[f"double_blocks.{i}.img_mod.lin"] = [_get_mod_out(), _get_mod_out()] # mod1 (attn), mod2 (mlp)
-        mod_dict[f"double_blocks.{i}.txt_mod.lin"] = [_get_mod_out(), _get_mod_out()] # mod1 (attn), mod2 (mlp)
-
-    for i in range(num_single_blocks):
-        mod_dict[f"single_blocks.{i}.modulation.lin"] = _get_mod_out()
-        
-    # For Chroma, final_layer_custom_path is True, so we don't use adaLN_modulation from approximator for final layer.
-    # The `final_norm` and `final_linear` are directly part of Flux class for Chroma.
-
-    if current_idx > L_mod :
-        logger.error(f"Overran modulation vectors. Consumed {current_idx}, had {L_mod}.")
-    elif current_idx < expected_total_vecs and L_mod >= expected_total_vecs : # Consumed less than expected, but had enough
-        logger.warning(f"Underran modulation vectors but had enough. Consumed {current_idx}, available {L_mod}, expected for blocks {expected_total_vecs}.")
-    elif L_mod < expected_total_vecs: # Didn't have enough to begin with
-        logger.warning(f"Did not have enough modulation vectors. Consumed {current_idx}, available {L_mod}, needed for blocks {expected_total_vecs}.")
-
-    return mod_dict
-
-
-class FeatureFusionDistillerLayer(nn.Module): # To match Ostris/Chroma checkpoint keys
-    def __init__(self, hidden_dim: int):
-        super().__init__()
-        # Checkpoint has keys like 'distilled_guidance_layer.layers.0.in_layer.weight'
-        self.in_layer = nn.Linear(hidden_dim, hidden_dim, bias=True)
-        self.out_layer = nn.Linear(hidden_dim, hidden_dim, bias=True)
-        self.act = nn.GELU(approximate="tanh") # As per changelog
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.out_layer(self.act(self.in_layer(x)))
-
-class FeatureFusionDistiller(nn.Module): 
-    def __init__(self, input_dim: int, internal_dim: int, output_dim: int, num_internal_layers: int = 5):
-        super().__init__()
-        self.in_proj = nn.Linear(input_dim, internal_dim, bias=True)
-        self.layers = nn.ModuleList([FeatureFusionDistillerLayer(internal_dim) for _ in range(num_internal_layers)])
-        self.norms = nn.ModuleList([RMSNorm(internal_dim) for _ in range(num_internal_layers)])
-        self.out_proj = nn.Linear(internal_dim, output_dim, bias=True)
-
+    @property
+    def device(self): return next(self.parameters()).device
     def forward(self, x: Tensor) -> Tensor:
         x = self.in_proj(x)
-        for i, layer_group in enumerate(self.layers): # layer_group is FeatureFusionDistillerLayer
-            residual = x
-            x_normed = self.norms[i](x)
-            x = residual + layer_group(x_normed) # Pass normed x to the layer_group
-        return self.out_proj(x)
+        for layer, norm_layer in zip(self.layers, self.norms):
+            x = x + layer(norm_layer(x))
+        x = self.out_proj(x)
+        return x
 
-# endregion
+
+class QKNorm(torch.nn.Module):
+    def __init__(self, dim: int, use_compiled: bool = False):
+        super().__init__()
+        self.query_norm = RMSNorm(dim, use_compiled=use_compiled)
+        self.key_norm = RMSNorm(dim, use_compiled=use_compiled)
+        
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
+        q_normed = self.query_norm(q)
+        k_normed = self.key_norm(k)
+        return q_normed.to(v.dtype), k_normed.to(v.dtype)
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = False, use_compiled: bool = False):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.norm = QKNorm(head_dim, use_compiled=use_compiled)
+        self.proj = nn.Linear(dim, dim)
+        
+    def forward(self, x: Tensor, pe: Tensor, mask: Optional[Tensor]=None) -> Tensor:
+        qkv = self.qkv(x)
+        q, k, v = rearrange(qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        q, k = self.norm(q, k, v)
+        x = attention(q, k, v, pe=pe, mask=mask)
+        x = self.proj(x)
+        return x
+
+
+def _modulation_shift_scale_fn(x, scale, shift):
+    return (1 + scale) * x + shift
+
+def _modulation_gate_fn(x, gate, gate_params):
+    return x + gate * gate_params
+
 
 class DoubleStreamBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False,
-                 use_modulation: bool = True, has_main_norms: bool = True):
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float, qkv_bias: bool = False, use_compiled: bool = False):
         super().__init__()
-        self.hidden_size, self.num_heads, self.use_modulation, self.has_main_norms = hidden_size, num_heads, use_modulation, has_main_norms
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        
-        if self.use_modulation: # Schnell/Dev path
-            self.img_mod, self.txt_mod = Modulation(hidden_size, True), Modulation(hidden_size, True)
-        
-        # For Chroma (use_modulation=False), if has_main_norms is True, LayerNorms are affine.
-        # If has_main_norms is False (as per flux_chroma_params), they are Identity.
-        if self.has_main_norms:
-            # Affine if NOT using internal modulation (i.e., for Chroma if norms are present)
-            # OR if using internal modulation but the norm is supposed to be affine anyway (original FLUX behavior)
-            # The critical point is whether the checkpoint HAS these affine weights.
-            # For Chroma, `double_block_has_main_norms` is set to False in params, so this branch is skipped.
-            is_affine_for_norm = not self.use_modulation 
-            self.img_norm1 = nn.LayerNorm(hidden_size, eps=1e-6, elementwise_affine=is_affine_for_norm)
-            self.img_norm2 = nn.LayerNorm(hidden_size, eps=1e-6, elementwise_affine=is_affine_for_norm)
-            self.txt_norm1 = nn.LayerNorm(hidden_size, eps=1e-6, elementwise_affine=is_affine_for_norm)
-            self.txt_norm2 = nn.LayerNorm(hidden_size, eps=1e-6, elementwise_affine=is_affine_for_norm)
-        else: # This path will be taken by Chroma due to flux_chroma_params
-            self.img_norm1, self.img_norm2 = nn.Identity(), nn.Identity()
-            self.txt_norm1, self.txt_norm2 = nn.Identity(), nn.Identity()
-            # logger.debug("DoubleStreamBlock initialized with Identity norms (Chroma path).")
+        self.num_heads = num_heads
+        self.hidden_size = hidden_size
+        self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.img_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias, use_compiled=use_compiled)
+        self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.img_mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+        )
+        self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.txt_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias, use_compiled=use_compiled)
+        self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.txt_mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+        )
+        self.use_compiled = use_compiled
 
-        self.img_attn = SelfAttention(hidden_size, num_heads, qkv_bias)
-        self.img_mlp = nn.Sequential(nn.Linear(hidden_size, mlp_hidden_dim, True), nn.GELU(approximate="tanh"), nn.Linear(mlp_hidden_dim, hidden_size, True))
-        self.txt_attn = SelfAttention(hidden_size, num_heads, qkv_bias)
-        self.txt_mlp = nn.Sequential(nn.Linear(hidden_size, mlp_hidden_dim, True), nn.GELU(approximate="tanh"), nn.Linear(mlp_hidden_dim, hidden_size, True))
-        self.gradient_checkpointing = False; self.cpu_offload_checkpointing = False
+    @property
+    def device(self): return next(self.parameters()).device
 
-    def enable_gradient_checkpointing(self, cpu_offload: bool = False): self.gradient_checkpointing, self.cpu_offload_checkpointing = True, cpu_offload
-    def disable_gradient_checkpointing(self): self.gradient_checkpointing, self.cpu_offload_checkpointing = False, False
-    def _forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, txt_attention_mask: Optional[Tensor] = None,
-                 distill_img_mod_params: Optional[List[ModulationOut]] = None, distill_txt_mod_params: Optional[List[ModulationOut]] = None) -> tuple[Tensor, Tensor]:
+    def _compiled_modulation_shift_scale_fn(self, x, scale, shift):
+        return torch.compile(_modulation_shift_scale_fn)(x, scale, shift)
+    
+    def _compiled_modulation_gate_fn(self, x, gate, gate_params):
+        return torch.compile(_modulation_gate_fn)(x, gate, gate_params)
+
+    def forward( self, img: Tensor, txt: Tensor, pe: Tensor,
+                 distill_vec: list[list[ModulationOut]],
+                 mask: Optional[Tensor]=None
+                ) -> tuple[Tensor, Tensor]:
+        
+        (img_mod_attn, img_mod_mlp), (txt_mod_attn, txt_mod_mlp) = distill_vec[0], distill_vec[1]
+
         img_res, txt_res = img, txt
-        # Norms are applied regardless of being Identity or LayerNorm
-        img_n, txt_n = self.img_norm1(img), self.txt_norm1(txt) 
 
-        if self.use_modulation: # Schnell/Dev path
-            img_m1, img_m2 = self.img_mod(vec); txt_m1, txt_m2 = self.txt_mod(vec)
-        elif distill_img_mod_params and distill_txt_mod_params: # Chroma path with provided external modulations
-            img_m1, img_m2 = distill_img_mod_params; txt_m1, txt_m2 = distill_txt_mod_params
-        else: # Fallback for Chroma if approximator isn't used/set up, or for general unconditioned blocks
-            s = torch.zeros_like(img_n[:,0:1,:]) if img_n.numel() > 0 else torch.tensor(0., device=img.device, dtype=img.dtype).view(1,1,1).expand(img.shape[0],1,img.shape[-1])
-            sc = torch.zeros_like(s) # scale = 0 => 1+scale=1
-            g = torch.ones_like(s)   # gate = 1
-            img_m1 = img_m2 = txt_m1 = txt_m2 = ModulationOut(s,sc,g)
-            if not self.use_modulation: logger.debug("DoubleStreamBlock (Chroma path) using identity mod_params as none were distilled/provided.")
+
+        img_modulated_for_qkv = _modulation_shift_scale_fn(self.img_norm1(img_res), img_mod_attn.scale, img_mod_attn.shift)
+        img_qkv = self.img_attn.qkv(img_modulated_for_qkv)
+        img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
+
+        txt_modulated_for_qkv = _modulation_shift_scale_fn(self.txt_norm1(txt_res), txt_mod_attn.scale, txt_mod_attn.shift)
+        txt_qkv = self.txt_attn.qkv(txt_modulated_for_qkv)
+        txt_q, txt_k, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
+
+        q_joint = torch.cat((txt_q, img_q), dim=2)
+        k_joint = torch.cat((txt_k, img_k), dim=2)
+        v_joint = torch.cat((txt_v, img_v), dim=2)
         
-        img_nm, txt_nm = (1+img_m1.scale)*img_n+img_m1.shift, (1+txt_m1.scale)*txt_n+txt_m1.shift
-        img_q,img_k,img_v=rearrange(self.img_attn.qkv(img_nm),"B L (K H D)->K B H L D",K=3,H=self.num_heads); img_q,img_k=self.img_attn.norm(img_q,img_k,img_v)
-        txt_q,txt_k,txt_v=rearrange(self.txt_attn.qkv(txt_nm),"B L (K H D)->K B H L D",K=3,H=self.num_heads); txt_q,txt_k=self.txt_attn.norm(txt_q,txt_k,txt_v)
-        q,k,v=torch.cat((txt_q,img_q),2),torch.cat((txt_k,img_k),2),torch.cat((txt_v,img_v),2)
-        mask_exp = None
-        if txt_attention_mask is not None: # txt_attention_mask is (B, L_txt)
-            img_mask_shape_L = img.shape[1] if img.ndim == 3 else (img.shape[1] * img.shape[2] if img.ndim == 4 else img.shape[1]) # Handle packed/unpacked
-            img_mask = torch.ones(txt_attention_mask.shape[0], img_mask_shape_L, device=txt_attention_mask.device, dtype=torch.bool)
-            full_mask = torch.cat((txt_attention_mask, img_mask), dim=1)
-            # Ensure L_total matches q/k/v sequence length
-            L_total_qkv = q.shape[2] 
-            if full_mask.shape[1] != L_total_qkv:
-                logger.warning(f"Attention mask length ({full_mask.shape[1]}) mismatch with QKV sequence length ({L_total_qkv}). Adjusting mask.")
-                # This might happen if L_img changes due to packing/unpacking not accounted for.
-                # A robust solution would be to ensure L_img is correctly derived.
-                # For now, a simple truncation or padding might be a temporary fix, but it's not ideal.
-                # Let's assume the logic for img_mask_shape_L should be correct based on `img` passed to the block.
-                if full_mask.shape[1] > L_total_qkv : full_mask = full_mask[:, :L_total_qkv]
-                elif full_mask.shape[1] < L_total_qkv: # Pad with ones (attend)
-                    padding = torch.ones(full_mask.shape[0], L_total_qkv - full_mask.shape[1], device=full_mask.device, dtype=torch.bool)
-                    full_mask = torch.cat((full_mask, padding), dim=1)
-            mask_exp = ~(full_mask[:, None, None, :].expand(-1, q.shape[1], L_total_qkv, L_total_qkv))
+        attn_output_joint = attention(q_joint, k_joint, v_joint, pe=pe, mask=mask)
+        
+        txt_attn_output = attn_output_joint[:, :txt_res.shape[1]]
+        img_attn_output = attn_output_joint[:, txt_res.shape[1]:]
 
+        img_after_attn = _modulation_gate_fn(img_res, img_mod_attn.gate, self.img_attn.proj(img_attn_output))
+        img_mlp_input = _modulation_shift_scale_fn(self.img_norm2(img_after_attn), img_mod_mlp.scale, img_mod_mlp.shift)
+        img_final = _modulation_gate_fn(img_after_attn, img_mod_mlp.gate, self.img_mlp(img_mlp_input))
 
-        joint_out = attention(q,k,v,pe,mask_exp); txt_att,img_att = joint_out[:,:txt.shape[1]],joint_out[:,txt.shape[1]:]
-        img_after = img_res + img_m1.gate * self.img_attn.proj(img_att)
-        img = img_after + img_m2.gate * self.img_mlp((1+img_m2.scale)*self.img_norm2(img_after)+img_m2.shift)
-        txt_after = txt_res + txt_m1.gate * self.txt_attn.proj(txt_att)
-        txt = txt_after + txt_m2.gate * self.txt_mlp((1+txt_m2.scale)*self.txt_norm2(txt_after)+txt_m2.shift)
-        return img, txt
-    def forward(self, *args, **kwargs):
-        if self.training and self.gradient_checkpointing:
-            if not self.cpu_offload_checkpointing: return checkpoint(self._forward, *args, use_reentrant=False, **kwargs)
-            def create_cf(func): return lambda *i: to_cpu(func(*to_cuda(i)))
-            return torch.utils.checkpoint.checkpoint(create_cf(self._forward), *args, use_reentrant=False, **kwargs)
-        return self._forward(*args, **kwargs)
+        txt_after_attn = _modulation_gate_fn(txt_res, txt_mod_attn.gate, self.txt_attn.proj(txt_attn_output))
+        txt_mlp_input = _modulation_shift_scale_fn(self.txt_norm2(txt_after_attn), txt_mod_mlp.scale, txt_mod_mlp.shift)
+        txt_final = _modulation_gate_fn(txt_after_attn, txt_mod_mlp.gate, self.txt_mlp(txt_mlp_input))
+
+        return img_final, txt_final
+
 
 class SingleStreamBlock(nn.Module):
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0, use_modulation: bool = True):
+    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0, qk_scale: float | None = None, use_compiled: bool = False):
         super().__init__()
-        self.hidden_size,self.num_heads,self.use_modulation = hidden_size,num_heads,use_modulation
-        h_dim,self.mlp_hidden_dim = hidden_size//num_heads,int(hidden_size*mlp_ratio)
-        # For Chroma (use_modulation=False), pre_norm should be elementwise_affine=False as per missing keys.
-        self.pre_norm = nn.LayerNorm(hidden_size, eps=1e-6, elementwise_affine=False if not self.use_modulation else True)
-        self.linear1 = nn.Linear(hidden_size, hidden_size*3+self.mlp_hidden_dim, bias=True)
-        self.norm = QKNorm(h_dim); self.mlp_act = nn.GELU("tanh")
-        self.linear2 = nn.Linear(hidden_size+self.mlp_hidden_dim, hidden_size, bias=True)
-        if self.use_modulation: self.modulation = Modulation(hidden_size, False)
-        self.gradient_checkpointing=False; self.cpu_offload_checkpointing=False
-    def enable_gradient_checkpointing(self, cpu_offload: bool = False): self.gradient_checkpointing,self.cpu_offload_checkpointing = True,cpu_offload
-    def disable_gradient_checkpointing(self): self.gradient_checkpointing,self.cpu_offload_checkpointing = False,False
-    def _forward(self, x: Tensor, vec: Tensor, pe: Tensor, txt_attention_mask: Optional[Tensor] = None, distill_mod_params: Optional[ModulationOut] = None) -> Tensor:
-        res,x_n=x,self.pre_norm(x); final_gate=None
-        if self.use_modulation: mod,_=self.modulation(vec); x_mod,final_gate=(1+mod.scale)*x_n+mod.shift,mod.gate
-        elif distill_mod_params: x_mod,final_gate=(1+distill_mod_params.scale)*x_n+distill_mod_params.shift,distill_mod_params.gate
-        else: 
-            x_mod=x_n
-            if not self.use_modulation: logger.debug("SingleStreamBlock (Chroma path) using identity mod_params as none were distilled/provided.")
+        self.hidden_dim = hidden_size
+        self.num_heads = num_heads
+        head_dim = hidden_size // num_heads
         
-        proj_feat=self.linear1(x_mod); qkv_c,mlp_in_f=torch.split(proj_feat,[3*self.hidden_size,self.mlp_hidden_dim],dim=-1)
-        q,k,v=rearrange(qkv_c,"B L (K H D)->K B H L D",K=3,H=self.num_heads); q_n,k_n=self.norm(q,k,v)
-        mask_exp=None; 
-        if txt_attention_mask is not None: # txt_attention_mask is (B, L_total)
-             mask_exp = ~(txt_attention_mask.to(torch.bool)[:,None,None,:].expand(-1,self.num_heads,x.shape[1],-1))
-        attn_o=attention(q_n,k_n,v,pe,mask_exp); mlp_o=self.mlp_act(mlp_in_f)
-        out_upd=self.linear2(torch.cat((attn_o,mlp_o),dim=-1))
-        return res+final_gate*out_upd if final_gate is not None else res+out_upd
-    def forward(self, *args, **kwargs):
-        if self.training and self.gradient_checkpointing:
-            if not self.cpu_offload_checkpointing: return checkpoint(self._forward, *args, use_reentrant=False, **kwargs)
-            def create_cf(func): return lambda *i: to_cpu(func(*to_cuda(i)))
-            return torch.utils.checkpoint.checkpoint(create_cf(self._forward), *args, use_reentrant=False, **kwargs)
-        return self._forward(*args, **kwargs)
+        self.mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.linear1 = nn.Linear(hidden_size, hidden_size * 3 + self.mlp_hidden_dim, bias=True)
+        self.linear2 = nn.Linear(hidden_size + self.mlp_hidden_dim, hidden_size, bias=True)
 
-class Flux(nn.Module):
-    def __init__(self, params: FluxParams):
+        self.norm = QKNorm(head_dim, use_compiled=use_compiled)
+        self.pre_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.mlp_act = nn.GELU(approximate="tanh")
+        self.use_compiled = use_compiled
+
+    @property
+    def device(self): return next(self.parameters()).device
+    
+    def forward(self, x: Tensor, pe: Tensor, distill_vec: ModulationOut, mask: Optional[Tensor]=None) -> Tensor:
+        mod = distill_vec
+        x_res = x
+
+        x_normed = self.pre_norm(x)
+        x_modulated = _modulation_shift_scale_fn(x_normed, mod.scale, mod.shift)
+        
+        qkv_combined, mlp_in_features = torch.split(
+            self.linear1(x_modulated), [3 * self.hidden_dim, self.mlp_hidden_dim], dim=-1
+        )
+        
+        q, k, v = rearrange(qkv_combined, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        q, k = self.norm(q, k, v)
+        
+        attn_output = attention(q, k, v, pe=pe, mask=mask)
+        mlp_output_activated = self.mlp_act(mlp_in_features)
+        
+        combined_features = torch.cat((attn_output, mlp_output_activated), dim=-1)
+        output_projection = self.linear2(combined_features)
+        
+        return _modulation_gate_fn(x_res, mod.gate, output_projection)
+
+
+class LastLayer(nn.Module):
+    def __init__(self, hidden_size: int, patch_size: int, out_channels: int, use_compiled: bool = False):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
+        
+    @property
+    def device(self): return next(self.parameters()).device
+
+    def forward(self, x: Tensor, distill_vec: list[Tensor]) -> Tensor:
+        shift, scale = distill_vec[0], distill_vec[1]
+        
+        if shift.ndim == 3 and shift.shape[1] == 1: shift = shift.squeeze(1)
+        if scale.ndim == 3 and scale.shape[1] == 1: scale = scale.squeeze(1)
+
+        x_normed = self.norm_final(x)
+        x_modulated = (1 + scale.unsqueeze(1)) * x_normed + shift.unsqueeze(1)
+        x_out = self.linear(x_modulated)
+        return x_out
+
+# --- End Official Chroma Layer Definitions ---
+
+
+# --- ChromaModel definition ---
+@dataclass
+class ChromaModelParams:
+    in_channels: int = 64
+    context_in_dim: int = 4096
+    hidden_size: int = 3072
+    mlp_ratio: float = 4.0
+    num_heads: int = 24
+    depth: int = 19
+    depth_single_blocks: int = 38
+    axes_dim: list[int] = field(default_factory=lambda: [16, 56, 56])
+    theta: int = 10_000
+    qkv_bias: bool = True
+    approximator_in_dim: int = 64
+    approximator_depth: int = 5
+    approximator_hidden_size: int = 5120
+    approximator_out_dim_per_mod_vector: int = 3072
+    mod_index_length: int = 344
+
+def get_chroma_model_params():
+    return ChromaModelParams()
+
+def modify_mask_to_attend_padding(mask: Tensor, max_len: int, num_to_attend: int) -> Tensor:
+    mask = mask.bool()
+    valid_lengths = mask.long().sum(dim=1)
+    new_mask = mask.clone()
+    for i in range(mask.shape[0]):
+        current_len = valid_lengths[i]
+        attend_until = min(current_len + num_to_attend, max_len)
+        if current_len < max_len:
+            new_mask[i, current_len:attend_until] = True
+    return new_mask
+
+class ChromaModel(nn.Module):
+    def __init__(self, params: ChromaModelParams):
         super().__init__()
         self.params_dto = params
         self.in_channels = params.in_channels
-        self.out_channels = params.in_channels
+        self.out_channels = self.in_channels
 
-        if params.hidden_size % params.num_heads != 0: 
-            raise ValueError(f"Hidden {params.hidden_size} not div by {params.num_heads}")
+        if params.hidden_size % params.num_heads != 0:
+            raise ValueError(f"Hidden size {params.hidden_size} must be divisible by num_heads {params.num_heads}")
         pe_dim = params.hidden_size // params.num_heads
-        if sum(params.axes_dim) != pe_dim: 
+        if sum(params.axes_dim) != pe_dim:
             raise ValueError(f"axes_dim sum {sum(params.axes_dim)} != pe_dim {pe_dim}")
         
         self.hidden_size = params.hidden_size
         self.num_heads = params.num_heads
 
-        self.pe_embedder=EmbedND(pe_dim,params.theta,params.axes_dim)
-        self.img_in=nn.Linear(params.in_channels,params.hidden_size,True)
-        self.txt_in=nn.Linear(params.context_in_dim,params.hidden_size,True)
+        self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
+        self.img_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
+        self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size, bias=True)
 
-        self.double_blocks=nn.ModuleList([DoubleStreamBlock(params.hidden_size,params.num_heads,params.mlp_ratio,params.qkv_bias,params.use_modulation,params.double_block_has_main_norms) for _ in range(params.depth)])
-        self.single_blocks=nn.ModuleList([SingleStreamBlock(params.hidden_size,params.num_heads,params.mlp_ratio,params.use_modulation) for _ in range(params.depth_single_blocks)])
+        out_dim_approx = params.approximator_out_dim_per_mod_vector if params.approximator_out_dim_per_mod_vector != 0 else params.hidden_size
+        self.distilled_guidance_layer = Approximator(
+            params.approximator_in_dim,
+            out_dim_approx,
+            params.approximator_hidden_size,
+            params.approximator_depth,
+        )
+        self.register_buffer('mod_index', torch.arange(params.mod_index_length), persistent=False)
+        self.mod_index_length = params.mod_index_length
+        logger.info(f"ChromaModel: Initialized self.distilled_guidance_layer as Approximator with {params.approximator_depth} layers.")
 
-        # --- Component Initialization based on model type (Chroma vs. Dev/Schnell) ---
-        if not params.use_modulation: # This is the Chroma path
-            self.time_in = None
-            self.vector_in = None
-            self.guidance_in = nn.Identity() # As per flux_chroma_params guidance_embed=False
+        self.double_blocks = nn.ModuleList(
+            [DoubleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio, qkv_bias=params.qkv_bias)
+             for _ in range(params.depth)]
+        )
+        self.single_blocks = nn.ModuleList(
+            [SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio)
+             for _ in range(params.depth_single_blocks)]
+        )
+        self.final_layer = LastLayer(self.hidden_size, 1, self.out_channels)
 
-            # Main modulator (Approximator) for Chroma.
-            # Its weights are expected under "distilled_guidance_layer.*" in the checkpoint.
-            if params.approximator_config and params.use_distilled_guidance_layer:
-                # `use_distilled_guidance_layer` for Chroma means this Approximator is used.
-                app_cfg = params.approximator_config
-                out_dim_for_approx = app_cfg.out_dim_per_mod_vector if app_cfg.out_dim_per_mod_vector != 0 else params.hidden_size
-                
-                self.distilled_guidance_layer = Approximator(
-                    app_cfg.in_dim, out_dim_for_approx, app_cfg.hidden_dim, app_cfg.n_layers # n_layers is 5 from ApproximatorParams
-                )
-                self.register_buffer('mod_index', torch.arange(app_cfg.mod_index_length), persistent=False)
-                self.mod_index_length = app_cfg.mod_index_length
-                logger.info(f"Chroma Path: Initialized self.distilled_guidance_layer as Approximator with {app_cfg.n_layers} layers for block modulation.")
-            else:
-                self.distilled_guidance_layer = None
-                if params.approximator_config : # Only error if config was present but use_distilled_guidance_layer was false
-                    logger.error("Chroma Path: Approximator config present, but use_distilled_guidance_layer is False. No main modulator created.")
-                elif not params.approximator_config:
-                     logger.error("Chroma Path: Approximator config missing, cannot create distilled_guidance_layer (Approximator).")
-
-
-            # The FeatureFusionDistiller is NOT part of the standard Chroma pruned model's weight structure.
-            # If you intend to add it as a *new, trainable* component on top of Chroma, that's different.
-            # For loading a base Chroma model, it should not be expected.
-            self.img_p_enhancer_module = None
-            # If you had a separate flag for an optional enhancer, you would check that here.
-            # For example: if params.use_optional_img_p_enhancer:
-            # self.img_p_enhancer_module = FeatureFusionDistiller(...)
-            # else:
-            # self.img_p_enhancer_module = None
-            logger.info("Chroma Path: self.img_p_enhancer_module (FeatureFusionDistiller) is set to None as it's not part of standard Chroma checkpoint.")
-            
-            self.modulation_approximator = None # Keep this explicitly None for Chroma
-
-        else: # Dev/Schnell Path
-            self.time_in = MLPEmbedder(256, params.hidden_size) if params.use_time_embed else None
-            self.vector_in = MLPEmbedder(params.vec_in_dim, params.hidden_size) if params.use_vector_embed else None
-            self.guidance_in = MLPEmbedder(256, params.hidden_size) if params.guidance_embed else nn.Identity()
-            
-            self.distilled_guidance_layer = None 
-            self.img_p_enhancer_module = None
-            self.modulation_approximator = None 
-
-        self.final_layer = LastLayer(params.hidden_size, 1, self.out_channels)
-
-        self.gradient_checkpointing=False; self.cpu_offload_checkpointing=False; self.blocks_to_swap=None
-        self.offloader_double=None; self.offloader_single=None
-        self.num_double_blocks,self.num_single_blocks=len(self.double_blocks),len(self.single_blocks)
+        self.blocks_to_swap = None
+        self.offloader_double = None
+        self.offloader_single = None
+        self.num_double_blocks = len(self.double_blocks)
+        self.num_single_blocks = len(self.single_blocks)
+        self.gradient_checkpointing = False
+        self.cpu_offload_checkpointing = False # Added for compatibility with existing log
+        
     @property
     def device(self): return next(self.parameters()).device
     @property
     def dtype(self): return next(self.parameters()).dtype
-    def enable_gradient_checkpointing(self, cpu_offload: bool = False):
-        self.gradient_checkpointing,self.cpu_offload_checkpointing=True,cpu_offload
-        for emb in [self.time_in,self.vector_in,self.guidance_in]:
-            if hasattr(emb,'enable_gradient_checkpointing'): emb.enable_gradient_checkpointing()
-        for blk in self.double_blocks+self.single_blocks: blk.enable_gradient_checkpointing(cpu_offload)
-        if self.modulation_approximator:
-            for layer in self.modulation_approximator.layers: # these are ApproximatorLayer, not MLPEmbedder
-                if hasattr(layer,'enable_gradient_checkpointing'): layer.enable_gradient_checkpointing() # MLPEmbedder had this, ApproximatorLayer doesn't
-        logger.info(f"FLUX: GC enabled. CPU offload: {cpu_offload}")
-    def disable_gradient_checkpointing(self):
-        self.gradient_checkpointing,self.cpu_offload_checkpointing=False,False
-        for emb in [self.time_in,self.vector_in,self.guidance_in]:
-            if hasattr(emb,'disable_gradient_checkpointing'): emb.disable_gradient_checkpointing()
-        for blk in self.double_blocks+self.single_blocks: blk.disable_gradient_checkpointing()
-        if self.modulation_approximator:
-            for layer in self.modulation_approximator.layers:
-                if hasattr(layer,'disable_gradient_checkpointing'): layer.disable_gradient_checkpointing()
-        logger.info("FLUX: GC disabled.")
+
+    def enable_gradient_checkpointing(self, cpu_offload: bool = False): 
+        self.gradient_checkpointing = True
+        self.cpu_offload_checkpointing = cpu_offload # Store for logging or other logic
+        logger.info(f"ChromaModel: Gradient Checkpointing enabled. CPU offload: {cpu_offload}")
+    def disable_gradient_checkpointing(self): 
+        self.gradient_checkpointing = False
+        self.cpu_offload_checkpointing = False
+        logger.info(f"ChromaModel: Gradient Checkpointing disabled.")
+    
     def enable_block_swap(self, num_blocks: int, device: torch.device):
-        self.blocks_to_swap=num_blocks; db_s=num_blocks//2; sb_s=(num_blocks-db_s)*2
-        assert db_s<=self.num_double_blocks-2 and sb_s<=self.num_single_blocks-2
-        self.offloader_double=custom_offloading_utils.ModelOffloader(self.double_blocks,self.num_double_blocks,db_s,device)
-        self.offloader_single=custom_offloading_utils.ModelOffloader(self.single_blocks,self.num_single_blocks,sb_s,device)
-        logger.info(f"FLUX: Block swap enabled. Swapping {num_blocks} blocks (D:{db_s}, S:{sb_s}).")
-    def move_to_device_except_swap_blocks(self, device: torch.device):
-        if self.blocks_to_swap: s_db,s_sb=self.double_blocks,self.single_blocks; self.double_blocks,self.single_blocks=None,None
-        self.to(device)
-        if self.blocks_to_swap: self.double_blocks,self.single_blocks=s_db,s_sb
+        if self.num_double_blocks == 0 and self.num_single_blocks == 0:
+            logger.info("ChromaModel: No blocks to enable swap for.")
+            return
+        self.blocks_to_swap=num_blocks
+        db_s = min(num_blocks // 2, max(0, self.num_double_blocks - 2)) if self.num_double_blocks > 0 else 0
+        sb_s = min(num_blocks - db_s, max(0, self.num_single_blocks - 2)) if self.num_single_blocks > 0 else 0
+        
+        if db_s > 0 and self.num_double_blocks > 0 : # ensure blocks exist
+            self.offloader_double=custom_offloading_utils.ModelOffloader(self.double_blocks,self.num_double_blocks,db_s,device)
+        if sb_s > 0 and self.num_single_blocks > 0: # ensure blocks exist
+            self.offloader_single=custom_offloading_utils.ModelOffloader(self.single_blocks,self.num_single_blocks,sb_s,device)
+        logger.info(f"ChromaModel: Block swap enabled. Swapping up to {num_blocks} blocks (D:{db_s}, S:{sb_s}).")
+
     def prepare_block_swap_before_forward(self):
         if not self.blocks_to_swap: return
-        self.offloader_double.prepare_block_devices_before_forward(self.double_blocks)
-        self.offloader_single.prepare_block_devices_before_forward(self.single_blocks)
+        if self.offloader_double: self.offloader_double.prepare_block_devices_before_forward(self.double_blocks)
+        if self.offloader_single: self.offloader_single.prepare_block_devices_before_forward(self.single_blocks)
+    
+    def move_to_device_except_swap_blocks(self, device: torch.device): # For compatibility
+        if self.blocks_to_swap: 
+            s_db,s_sb = None, None
+            if self.offloader_double: 
+                s_db=self.double_blocks
+                self.double_blocks=None
+            if self.offloader_single:
+                s_sb=self.single_blocks
+                self.single_blocks=None
+        self.to(device)
+        if self.blocks_to_swap: 
+            if self.offloader_double and s_db is not None: self.double_blocks=s_db
+            if self.offloader_single and s_sb is not None: self.single_blocks=s_sb
 
-    def forward(self, img: Tensor, img_ids: Tensor, txt: Tensor, txt_ids: Tensor, timesteps: Tensor,
-                y: Tensor, guidance: Tensor|None=None, txt_attention_mask: Tensor|None=None, **kwargs) -> Tensor:
+
+    def forward(
+        self,
+        img: Tensor,
+        img_ids: Tensor,
+        txt: Tensor,
+        txt_ids: Tensor,
+        timesteps: Tensor,
+        y: Optional[Tensor], 
+        guidance: Optional[Tensor] = None,
+        txt_attention_mask: Optional[Tensor] = None,
+        attn_padding: int = 1
+    ) -> Tensor:
         
-        log_tensor_stats(img, "Flux_fwd_SOT_noisy_input_packed", logger_obj=logger)
+        log_tensor_stats(img, "ChromaModel_fwd_SOT_noisy_input_packed", logger_obj=logger)
         if img.ndim != 3 or txt.ndim != 3:
             raise ValueError(f"Inputs img/txt must be 3D. Got img: {img.ndim}D, txt: {txt.ndim}D")
             
         img_p = self.img_in(img)
-        log_tensor_stats(img_p, "Flux_fwd_after_img_in", logger_obj=logger)
-
-        if hasattr(self, 'img_p_enhancer_module') and self.img_p_enhancer_module is not None:
-            enhancement = self.img_p_enhancer_module(img) 
-            log_tensor_stats(enhancement, "Flux_fwd_img_p_enhancer_out", logger_obj=logger)
-            img_p = img_p + enhancement 
-            log_tensor_stats(img_p, "Flux_fwd_img_p_after_enhancement_add", logger_obj=logger)
+        log_tensor_stats(img_p, "ChromaModel_fwd_after_img_in", logger_obj=logger)
         
-        txt_f = self.txt_in(txt) 
-        log_tensor_stats(txt_f, "Flux_fwd_after_txt_in", logger_obj=logger)
+        txt_f = self.txt_in(txt)
+        log_tensor_stats(txt_f, "ChromaModel_fwd_after_txt_in", logger_obj=logger)
 
-        int_cond_parts=[]
-        if self.time_in is not None and not isinstance(self.time_in, nn.Identity): 
-            time_emb = self.time_in(timestep_embedding(timesteps,256))
-            int_cond_parts.append(time_emb)
+        _bs = img.shape[0]
+        ts_emb_approx = timestep_embedding(timesteps.reshape(-1), 16)
+        guid_val_approx = guidance if guidance is not None else torch.zeros_like(timesteps.reshape(-1))
+        guid_emb_approx = timestep_embedding(guid_val_approx.reshape(-1), 16)
         
-        if hasattr(self, 'guidance_in') and self.guidance_in is not None and not isinstance(self.guidance_in, nn.Identity) and guidance is not None :
-            # This path should NOT be taken for Chroma if guidance_in is nn.Identity()
-            guidance_emb = self.guidance_in(timestep_embedding(guidance,256))
-            int_cond_parts.append(guidance_emb)
+        mod_idx_device = self.mod_index.to(device=img.device, non_blocking=True)
+        mod_idx_batched = mod_idx_device.unsqueeze(0).repeat(_bs, 1)
+        mod_idx_emb = timestep_embedding(mod_idx_batched, 32)
+        
+        ts_guid_combined_emb_approx = torch.cat([ts_emb_approx, guid_emb_approx], dim=-1)
+        ts_guid_emb_approx_repeated = ts_guid_combined_emb_approx.unsqueeze(1).repeat(1, self.mod_index_length, 1)
+        
+        approx_in = torch.cat([ts_guid_emb_approx_repeated, mod_idx_emb], dim=-1)
+        log_tensor_stats(approx_in, "ChromaModel_fwd_approx_in_to_distilled_guidance_layer", logger_obj=logger)
 
-        if self.vector_in is not None and not isinstance(self.vector_in, nn.Identity) and y is not None: 
-            vector_emb = self.vector_in(y)
-            int_cond_parts.append(vector_emb)
-        
-        internal_cond_vec = sum(int_cond_parts) if int_cond_parts else \
-                            torch.zeros(img.shape[0], self.hidden_size, device=img.device, dtype=img.dtype)
-        log_tensor_stats(internal_cond_vec, "Flux_fwd_internal_cond_vec_final", logger_obj=logger)
-        
-        mod_vecs_chroma=None
-        if not self.params_dto.use_modulation and hasattr(self, 'distilled_guidance_layer') and self.distilled_guidance_layer is not None:
-            if not isinstance(self.distilled_guidance_layer, Approximator):
-                logger.error("CRITICAL: self.distilled_guidance_layer is NOT an Approximator instance.")
-            else:
-                app_cfg = self.params_dto.approximator_config
-                if app_cfg is None:
-                    logger.error("CRITICAL: Approximator config missing for Chroma.")
-                else:
-                    _bs=img.shape[0]
-                    ts_emb_approx = timestep_embedding(timesteps,16) 
-                    guid_val_approx = guidance if guidance is not None else torch.zeros_like(timesteps, device=timesteps.device, dtype=timesteps.dtype)
-                    guid_emb_approx = timestep_embedding(guid_val_approx,16)
-                    
-                    mod_idx_device = self.mod_index.to(device=img.device, non_blocking=True)
-                    mod_idx_batched = mod_idx_device.unsqueeze(0).repeat(_bs, 1)
-                    mod_idx_emb = timestep_embedding(mod_idx_batched,32) 
-                    
-                    ts_guid_combined_emb_approx = torch.cat([ts_emb_approx, guid_emb_approx], dim=-1) 
-                    ts_guid_emb_approx_repeated = ts_guid_combined_emb_approx.unsqueeze(1).repeat(1, self.mod_index_length, 1) 
-                    
-                    approx_in = torch.cat([ts_guid_emb_approx_repeated, mod_idx_emb], dim=-1) 
-                    mod_vecs = self.distilled_guidance_layer(approx_in)
-                    mod_vecs_chroma = distribute_modulations_from_approximator(
-                        mod_vecs, self.num_double_blocks, self.num_single_blocks, self.params_dto
-                    )
-        elif not self.params_dto.use_modulation:
-            logger.warning("Flux_fwd: Chroma path but no 'distilled_guidance_layer' (Approximator). Default modulations.")
+        mod_vectors = self.distilled_guidance_layer(approx_in)
+        log_tensor_stats(mod_vectors, "ChromaModel_fwd_mod_vectors_from_distilled_guidance_layer", logger_obj=logger)
 
-        B, L_txt, _ = txt_f.shape 
-        txt_seq_positions = torch.arange(L_txt, device=txt_f.device, dtype=img_ids.dtype) 
+        mod_vectors_dict = distribute_modulations(
+            mod_vectors, self.num_double_blocks, self.num_single_blocks, final_layer_mod=True
+        )
+        if mod_vectors_dict:
+            logger.debug("ChromaModel_fwd: Successfully distributed modulations.")
+
+        B, L_txt_calc, _ = txt_f.shape
+        txt_seq_positions = torch.arange(L_txt_calc, device=txt_f.device, dtype=img_ids.dtype) 
         txt_seq_positions = txt_seq_positions.unsqueeze(0).expand(B, -1)
-        txt_pos_ids_3d = torch.zeros(B, L_txt, 3, device=txt_f.device, dtype=img_ids.dtype)
+        txt_pos_ids_3d = torch.zeros(B, L_txt_calc, 3, device=txt_f.device, dtype=img_ids.dtype)
         txt_pos_ids_3d[..., 0] = txt_seq_positions
         all_pos_ids = torch.cat((txt_pos_ids_3d, img_ids), dim=1)
         pe = self.pe_embedder(all_pos_ids)
@@ -900,153 +800,87 @@ class Flux(nn.Module):
         current_img_features = img_p
         current_txt_features = txt_f
 
-        for i,blk in enumerate(self.double_blocks):
-            dist_img_m, dist_txt_m = None, None
-            if mod_vecs_chroma:
-                dist_img_m = mod_vecs_chroma.get(f"double_blocks.{i}.img_mod.lin")
-                dist_txt_m = mod_vecs_chroma.get(f"double_blocks.{i}.txt_mod.lin")
+        L_img_calc = current_img_features.shape[1]
+        L_combined = L_txt_calc + L_img_calc
+        combined_mask_for_attn = None
+        if txt_attention_mask is not None:
+            if txt_attention_mask.shape[1] != L_txt_calc:
+                 logger.warning(f"txt_attention_mask length {txt_attention_mask.shape[1]} != txt_f feature length {L_txt_calc}. Adjusting mask.")
+                 if txt_attention_mask.shape[1] > L_txt_calc:
+                     txt_attention_mask = txt_attention_mask[:, :L_txt_calc]
+                 else:
+                     padding = torch.zeros(B, L_txt_calc - txt_attention_mask.shape[1], device=txt_attention_mask.device, dtype=txt_attention_mask.dtype)
+                     txt_attention_mask = torch.cat([txt_attention_mask, padding], dim=1)
+
+            txt_mask_w_padding = modify_mask_to_attend_padding(txt_attention_mask, L_txt_calc, attn_padding)
+            img_component_mask = torch.ones(B, L_img_calc, device=txt_mask_w_padding.device, dtype=txt_mask_w_padding.dtype)
+            combined_sequence_mask_1D = torch.cat([txt_mask_w_padding, img_component_mask], dim=1)
+            combined_mask_for_attn = ~(combined_sequence_mask_1D.bool().unsqueeze(1).expand(-1, L_combined, -1))
+
+        for i, blk in enumerate(self.double_blocks):
+            double_mod_for_block = [
+                mod_vectors_dict.get(f"double_blocks.{i}.img_mod.lin"),
+                mod_vectors_dict.get(f"double_blocks.{i}.txt_mod.lin")
+            ]
             if self.blocks_to_swap and self.offloader_double: self.offloader_double.wait_for_block(i)
-            current_img_features, current_txt_features = blk(
-                img=current_img_features, txt=current_txt_features, vec=internal_cond_vec, 
-                pe=pe, txt_attention_mask=txt_attention_mask,
-                distill_img_mod_params=dist_img_m, distill_txt_mod_params=dist_txt_m
-            )
+            
+            if self.gradient_checkpointing and self.training:
+                 current_img_features, current_txt_features = torch_checkpoint(
+                    blk, current_img_features, current_txt_features, pe, double_mod_for_block, combined_mask_for_attn, 
+                    use_reentrant=False
+                )
+            else:
+                current_img_features, current_txt_features = blk(
+                    img=current_img_features, txt=current_txt_features, pe=pe, 
+                    distill_vec=double_mod_for_block, mask=combined_mask_for_attn
+                )
             if torch.isnan(current_img_features).any() or torch.isnan(current_txt_features).any():
-                logger.error(f"NaN detected after DoubleStreamBlock {i}!")
+                logger.error(f"NaN detected after DoubleStreamBlock {i}!"); break
             if self.blocks_to_swap and self.offloader_double: self.offloader_double.submit_move_blocks(self.double_blocks,i)
+
+        if torch.isnan(current_img_features).any() or torch.isnan(current_txt_features).any():
+            nan_output_shape = (img.shape[0], img_p.shape[1], self.out_channels)
+            return torch.full(nan_output_shape, float('nan'), device=self.device, dtype=self.dtype)
+
+        sb_in = torch.cat((current_txt_features, current_img_features), dim=1)
+        log_tensor_stats(sb_in, "ChromaModel_fwd_sb_in_PRE_SB_LOOP", logger_obj=logger)
         
-        sb_in=torch.cat((current_txt_features,current_img_features),dim=1)
-        sb_attn_mask=None
-        if txt_attention_mask is not None and current_img_features is not None: 
-            img_mask_sb=torch.ones(txt_attention_mask.shape[0],current_img_features.shape[1],device=txt_attention_mask.device,dtype=txt_attention_mask.dtype)
-            sb_attn_mask=torch.cat((txt_attention_mask,img_mask_sb),dim=1)
+        for i, blk in enumerate(self.single_blocks):
+            single_mod_for_block = mod_vectors_dict.get(f"single_blocks.{i}.modulation.lin")
             
-        for i,blk in enumerate(self.single_blocks):
-            dist_s_mod = None
-            if mod_vecs_chroma:
-                dist_s_mod = mod_vecs_chroma.get(f"single_blocks.{i}.modulation.lin")
             if self.blocks_to_swap and self.offloader_single: self.offloader_single.wait_for_block(i)
-            sb_in = blk(
-                x=sb_in, vec=internal_cond_vec, pe=pe, 
-                txt_attention_mask=sb_attn_mask, distill_mod_params=dist_s_mod
-            )
+            if self.gradient_checkpointing and self.training:
+                sb_in = torch_checkpoint(
+                    blk, sb_in, pe, single_mod_for_block, combined_mask_for_attn,
+                    use_reentrant=False
+                )
+            else:
+                sb_in = blk(x=sb_in, pe=pe, distill_vec=single_mod_for_block, mask=combined_mask_for_attn)
             if torch.isnan(sb_in).any():
-                logger.error(f"NaN detected after SingleStreamBlock {i}!")
+                logger.error(f"NaN detected after SingleStreamBlock {i}!"); break
             if self.blocks_to_swap and self.offloader_single: self.offloader_single.submit_move_blocks(self.single_blocks,i)
-            
-        img_f_final=sb_in[:,current_txt_features.shape[1]:] 
+
+        if torch.isnan(sb_in).any():
+            nan_output_shape = (img.shape[0], img_p.shape[1], self.out_channels)
+            return torch.full(nan_output_shape, float('nan'), device=self.device, dtype=self.dtype)
+
+        img_f_final = sb_in[:, L_txt_calc:] 
+        log_tensor_stats(img_f_final, "ChromaModel_fwd_img_f_final_PRE_LASTLAYER", logger_obj=logger)
+        
         if self.training and self.cpu_offload_checkpointing and self.blocks_to_swap:
-            img_f_final=img_f_final.to(self.device) 
-            if internal_cond_vec.device != self.device:
-                internal_cond_vec = internal_cond_vec.to(self.device)
+            img_f_final = img_f_final.to(self.device)
             
-        img_out = self.final_layer(img_f_final, vec=internal_cond_vec, distill_vec=None)
+        final_mod_for_lastlayer = mod_vectors_dict.get("final_layer.adaLN_modulation.1")
+        if final_mod_for_lastlayer is None:
+            logger.warning("Modulation for final_layer not found in mod_vectors_dict. Using zeros.")
+            dummy_final_mod_shape = (img_f_final.shape[0], 1, self.hidden_size)
+            final_mod_for_lastlayer = [
+                torch.zeros(dummy_final_mod_shape, device=img_f_final.device, dtype=img_f_final.dtype),
+                torch.zeros(dummy_final_mod_shape, device=img_f_final.device, dtype=img_f_final.dtype)
+            ]
+
+        img_out = self.final_layer(img_f_final, distill_vec=final_mod_for_lastlayer)
+        log_tensor_stats(img_out, "ChromaModel_fwd_output_from_final_layer_img_out", logger_obj=logger)
         return img_out
 
-def zero_module(module): [nn.init.zeros_(p) for p in module.parameters()]; return module
-
-class ControlNetFlux(nn.Module):
-    def __init__(self, params: FluxParams, controlnet_depth=2, controlnet_single_depth=0):
-        super().__init__()
-        self.params=params; self.in_channels,self.out_channels=params.in_channels,params.in_channels
-        if params.hidden_size%params.num_heads!=0: raise ValueError(f"Hidden {params.hidden_size} not div by {params.num_heads}")
-        pe_dim=params.hidden_size//params.num_heads
-        if sum(params.axes_dim)!=pe_dim: raise ValueError(f"axes_dim sum {sum(params.axes_dim)} != pe_dim {pe_dim}")
-        self.hidden_size,self.num_heads=params.hidden_size,params.num_heads
-        self.pe_embedder=EmbedND(pe_dim,params.theta,params.axes_dim); self.img_in=nn.Linear(self.in_channels,self.hidden_size,True)
-        self.time_in=MLPEmbedder(256,self.hidden_size) if params.use_time_embed else None
-        self.vector_in=MLPEmbedder(params.vec_in_dim,self.hidden_size) if params.use_vector_embed else None
-        self.guidance_in=MLPEmbedder(256,self.hidden_size) if params.guidance_embed else nn.Identity()
-        self.txt_in=nn.Linear(params.context_in_dim,self.hidden_size,True)
-        self.double_blocks=nn.ModuleList([DoubleStreamBlock(self.hidden_size,self.num_heads,params.mlp_ratio,params.qkv_bias,params.use_modulation,params.double_block_has_main_norms) for _ in range(controlnet_depth)])
-        self.single_blocks=nn.ModuleList([SingleStreamBlock(self.hidden_size,self.num_heads,params.mlp_ratio,params.use_modulation) for _ in range(controlnet_single_depth)])
-        self.gradient_checkpointing=False; self.cpu_offload_checkpointing=False; self.blocks_to_swap=None
-        self.offloader_double=None; self.offloader_single=None
-        self.num_double_blocks,self.num_single_blocks=len(self.double_blocks),len(self.single_blocks)
-        self.controlnet_blocks=nn.ModuleList([zero_module(nn.Linear(self.hidden_size,self.hidden_size)) for _ in range(controlnet_depth)])
-        self.controlnet_blocks_for_single=nn.ModuleList([zero_module(nn.Linear(self.hidden_size,self.hidden_size)) for _ in range(controlnet_single_depth)])
-        self.pos_embed_input=nn.Linear(self.in_channels,self.hidden_size,True)
-        self.input_hint_block=nn.Sequential(nn.Conv2d(3,16,3,padding=1),nn.SiLU(),nn.Conv2d(16,16,3,padding=1),nn.SiLU(),nn.Conv2d(16,16,3,padding=1,stride=2),nn.SiLU(),nn.Conv2d(16,16,3,padding=1),nn.SiLU(),nn.Conv2d(16,16,3,padding=1,stride=2),nn.SiLU(),nn.Conv2d(16,16,3,padding=1),nn.SiLU(),nn.Conv2d(16,16,3,padding=1,stride=2),nn.SiLU(),zero_module(nn.Conv2d(16,16,3,padding=1)))
-        self.controlnet_modulation_approximator=None
-        if not params.use_modulation and params.approximator_config:
-            app_cfg=params.approximator_config; out_d=app_cfg.out_dim_per_mod_vector if app_cfg.out_dim_per_mod_vector!=0 else params.hidden_size
-            self.controlnet_modulation_approximator=Approximator(app_cfg.in_dim,out_d,app_cfg.hidden_dim,app_cfg.n_layers)
-            self.register_buffer('controlnet_mod_index',torch.arange(app_cfg.mod_index_length),persistent=False); self.controlnet_mod_index_length=app_cfg.mod_index_length
-    @property
-    def device(self): return next(self.parameters()).device
-    @property
-    def dtype(self): return next(self.parameters()).dtype
-    def enable_gradient_checkpointing(self, cpu_offload: bool = False):
-        self.gradient_checkpointing,self.cpu_offload_checkpointing=True,cpu_offload
-        for emb in [self.time_in,self.vector_in,self.guidance_in]:
-            if hasattr(emb,'enable_gradient_checkpointing'): emb.enable_gradient_checkpointing()
-        for blk in self.double_blocks+self.single_blocks: blk.enable_gradient_checkpointing(cpu_offload)
-        logger.info(f"ControlNetFLUX: GC enabled. CPU offload: {cpu_offload}")
-    def disable_gradient_checkpointing(self):
-        self.gradient_checkpointing,self.cpu_offload_checkpointing=False,False
-        for emb in [self.time_in,self.vector_in,self.guidance_in]:
-            if hasattr(emb,'disable_gradient_checkpointing'): emb.disable_gradient_checkpointing()
-        for blk in self.double_blocks+self.single_blocks: blk.disable_gradient_checkpointing()
-        logger.info("ControlNetFLUX: GC disabled.")
-    def enable_block_swap(self, num_blocks: int, device: torch.device):
-        self.blocks_to_swap=num_blocks
-        if self.num_double_blocks>0 or self.num_single_blocks>0 :
-            db_s=num_blocks//2 if self.num_double_blocks>0 else 0
-            sb_s=(num_blocks-db_s)*2 if self.num_double_blocks>0 and self.num_single_blocks>0 else (num_blocks*2 if self.num_single_blocks>0 else 0)
-            if self.num_double_blocks>2 and db_s>0: assert db_s<=self.num_double_blocks-2; self.offloader_double=custom_offloading_utils.ModelOffloader(self.double_blocks,self.num_double_blocks,db_s,device)
-            if self.num_single_blocks>2 and sb_s>0: assert sb_s<=self.num_single_blocks-2; self.offloader_single=custom_offloading_utils.ModelOffloader(self.single_blocks,self.num_single_blocks,sb_s,device)
-            logger.info(f"ControlNetFLUX: Block swap. Total: {num_blocks}, D:{db_s}, S:{sb_s}.")
-        else: logger.info("ControlNetFLUX: No blocks to swap.")
-    def move_to_device_except_swap_blocks(self, device: torch.device):
-        if self.blocks_to_swap and (self.offloader_double or self.offloader_single):
-            s_db,s_sb=self.double_blocks,self.single_blocks
-            if self.offloader_double: self.double_blocks=None
-            if self.offloader_single: self.single_blocks=None
-        self.to(device)
-        if self.blocks_to_swap and (self.offloader_double or self.offloader_single):
-            if self.offloader_double: self.double_blocks=s_db
-            if self.offloader_single: self.single_blocks=s_sb
-    def prepare_block_swap_before_forward(self):
-        if not self.blocks_to_swap: return
-        if self.offloader_double: self.offloader_double.prepare_block_devices_before_forward(self.double_blocks)
-        if self.offloader_single: self.offloader_single.prepare_block_devices_before_forward(self.single_blocks)
-    def forward(self, img: Tensor, img_ids: Tensor, controlnet_cond: Tensor, txt: Tensor, txt_ids: Tensor,
-                timesteps: Tensor, y: Tensor, guidance: Tensor|None=None, txt_attention_mask: Tensor|None=None) -> tuple[tuple[Tensor],tuple[Tensor]]:
-        if img.ndim!=3 or txt.ndim!=3: raise ValueError("Inputs img/txt must be 3D.")
-        img_p=self.img_in(img)+self.pos_embed_input(rearrange(self.input_hint_block(controlnet_cond),"b c (h ph) (w pw) -> b (h w) (c ph pw)",ph=(2 if self.params.in_channels==64 else 1),pw=(2 if self.params.in_channels==64 else 1)))
-        int_cond_parts=[]
-        if self.time_in: int_cond_parts.append(self.time_in(timestep_embedding(timesteps,256)))
-        if self.params.guidance_embed and guidance is not None and not isinstance(self.guidance_in,nn.Identity):
-            int_cond_parts.append(self.guidance_in(timestep_embedding(guidance,256)))
-        if self.vector_in: int_cond_parts.append(self.vector_in(y))
-        int_cond_vec=sum(int_cond_parts) if int_cond_parts else torch.zeros(img.shape[0],self.params.hidden_size,device=img.device,dtype=img.dtype)
-        mod_vecs_ctrl=None
-        if self.controlnet_modulation_approximator and self.params.approximator_config:
-            app_cfg=self.params.approximator_config; _bs=img.shape[0]
-            ts_e,guid_e=timestep_embedding(timesteps,16),timestep_embedding(guidance if guidance is not None else torch.zeros_like(timesteps),16)
-            mod_idx_e=timestep_embedding(self.controlnet_mod_index.unsqueeze(0).repeat(_bs,1),32)
-            ts_guid_e=torch.cat([ts_e,guid_e],dim=1).unsqueeze(1).repeat(1,self.controlnet_mod_index_length,1)
-            approx_in=torch.cat([ts_guid_e,mod_idx_e],dim=-1)
-            mod_vecs=self.controlnet_modulation_approximator(approx_in)
-            mod_vecs_ctrl=distribute_modulations_from_approximator(mod_vecs,self.num_double_blocks,self.num_single_blocks,self.params)
-        txt_p,pe=self.txt_in(txt),self.pe_embedder(torch.cat((txt_ids,img_ids),dim=1))
-        db_outs,sb_outs=[],[]
-        cur_img,cur_txt=img_p,txt_p
-        for i,blk in enumerate(self.double_blocks):
-            if self.blocks_to_swap and self.offloader_double: self.offloader_double.wait_for_block(i)
-            dist_img_m,dist_txt_m=(mod_vecs_ctrl.get(f"double_blocks.{i}.img_mod.lin"),mod_vecs_ctrl.get(f"double_blocks.{i}.txt_mod.lin")) if mod_vecs_ctrl else (None,None)
-            cur_img,cur_txt=blk(cur_img,cur_txt,int_cond_vec,pe,txt_attention_mask,dist_img_m,dist_txt_m)
-            db_outs.append(self.controlnet_blocks[i](cur_img))
-            if self.blocks_to_swap and self.offloader_double: self.offloader_double.submit_move_blocks(self.double_blocks,i)
-        sb_in=torch.cat((cur_txt,cur_img),dim=1)
-        sb_attn_mask=None
-        if txt_attention_mask is not None:
-            img_mask_sb=torch.ones(txt_attention_mask.shape[0],cur_img.shape[1],device=txt_attention_mask.device,dtype=txt_attention_mask.dtype)
-            sb_attn_mask=torch.cat((txt_attention_mask,img_mask_sb),dim=1)
-        for i,blk in enumerate(self.single_blocks):
-            if self.blocks_to_swap and self.offloader_single: self.offloader_single.wait_for_block(i)
-            dist_s_mod=mod_vecs_ctrl.get(f"single_blocks.{i}.modulation.lin") if mod_vecs_ctrl else None
-            sb_in=blk(sb_in,int_cond_vec,pe,sb_attn_mask,dist_s_mod)
-            sb_outs.append(self.controlnet_blocks_for_single[i](sb_in))
-            if self.blocks_to_swap and self.offloader_single: self.offloader_single.submit_move_blocks(self.single_blocks,i)
-        return tuple(db_outs),tuple(sb_outs)
+# --- End ChromaModel definition ---

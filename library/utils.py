@@ -427,27 +427,55 @@ class MemoryEfficientSafeOpen:
 
 
 def load_safetensors(
-    path: str, device: Union[str, torch.device], disable_mmap: bool = False, dtype: Optional[torch.dtype] = torch.float32
+    path: str, device: Union[str, torch.device], 
+    disable_mmap: bool = False, 
+    dtype: Optional[torch.dtype] = torch.float32, # Default dtype for conversion *after* loading
+    dtype_load_as_is: bool = False # New flag
 ) -> dict[str, torch.Tensor]:
+    target_device = torch.device(device) # Ensure it's a torch.device object
+
     if disable_mmap:
-        # return safetensors.torch.load(open(path, "rb").read())
-        # use experimental loader
-        # logger.info(f"Loading without mmap (experimental)")
         state_dict = {}
         with MemoryEfficientSafeOpen(path) as f:
             for key in f.keys():
-                state_dict[key] = f.get_tensor(key).to(device, dtype=dtype)
+                tensor = f.get_tensor(key) # Loads in its stored dtype to CPU
+                if not dtype_load_as_is and dtype is not None:
+                    tensor = tensor.to(dtype=dtype)
+                state_dict[key] = tensor.to(target_device)
         return state_dict
     else:
-        try:
-            state_dict = load_file(path, device=device)
-        except:
-            state_dict = load_file(path)  # prevent device invalid Error
-        if dtype is not None:
+        # safetensors.torch.load_file loads directly to the specified device
+        # and can cast dtype *if the tensor is not already on that device*.
+        # To load as is first, then cast, it's often easier to load to CPU.
+        if dtype_load_as_is:
+            # Load to CPU first, keeping original dtypes
+            state_dict = load_file(path, device="cpu")
+            # Then manually move/cast
             for key in state_dict.keys():
-                state_dict[key] = state_dict[key].to(dtype=dtype)
-        return state_dict
+                tensor = state_dict[key]
+                if dtype is not None: # This dtype is for the final model, not necessarily for loading
+                    # This logic might be slightly off. If dtype_load_as_is is true,
+                    # we might not want to cast with `dtype` here.
+                    # The casting should happen after model.load_state_dict, when model.to(dtype) is called.
+                    # So, if dtype_load_as_is, we just load and move to device.
+                    pass # No dtype conversion here if loading as is
+                state_dict[key] = tensor.to(target_device)
+            return state_dict
+        else:
+            # Original behavior: load_file handles device and can do some dtype conversion
+            try:
+                state_dict = load_file(path, device=device)
+            except Exception: # Broader catch if specific device load fails
+                 logger.warning(f"load_file to device '{device}' failed, trying CPU then moving.")
+                 state_dict = load_file(path, device="cpu")
+                 for key in state_dict.keys():
+                     state_dict[key] = state_dict[key].to(target_device)
 
+            if dtype is not None:
+                for key in state_dict.keys():
+                    if state_dict[key].dtype != dtype: # Only cast if different
+                        state_dict[key] = state_dict[key].to(dtype=dtype)
+            return state_dict
 
 # endregion
 

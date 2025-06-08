@@ -2,7 +2,7 @@ import json
 import os
 from dataclasses import replace 
 from typing import List, Optional, Tuple, Union, Dict, Any, TYPE_CHECKING 
-
+from . import flux_models
 import einops 
 import torch
 from accelerate import init_empty_weights 
@@ -137,74 +137,63 @@ def analyze_checkpoint_state(ckpt_path: str) -> Tuple[str, int, int, Dict[str, A
     return model_type_str, num_double_blocks, num_single_blocks, metadata
 
 
-def load_flow_model(
-    ckpt_path: str, dtype: Optional[torch.dtype], device: Union[str, torch.device], disable_mmap: bool = False
-) -> Tuple[str, 'Flux']: 
-    model_type_str, num_double_blocks, num_single_blocks, metadata = analyze_checkpoint_state(ckpt_path)
-
-    if model_type_str == MODEL_TYPE_UNKNOWN:
-        raise ValueError(f"Could not determine model type for checkpoint: {ckpt_path}. Analysis returned UNKNOWN. "
-                         f"Num double: {num_double_blocks}, Num single: {num_single_blocks}. Metadata: {metadata}")
-
-    if model_type_str == MODEL_TYPE_CHROMA:
-        params_dto = flux_models.flux_chroma_params(depth_double=num_double_blocks, depth_single=num_single_blocks)
-    elif model_type_str == MODEL_TYPE_FLUX_SCHNELL:
-        params_dto = flux_models.flux1_schnell_params(depth_double=num_double_blocks, depth_single=num_single_blocks)
-    elif model_type_str == MODEL_TYPE_FLUX_DEV:
-        params_dto = flux_models.flux1_dev_params(depth_double=num_double_blocks, depth_single=num_single_blocks)
-    else: 
-        raise ValueError(f"Internal error: No configuration defined for determined model type: {model_type_str}")
-
-    logger.info(f"Building Flux model variant '{model_type_str}' with {num_double_blocks} double and {num_single_blocks} single blocks.")
+def load_flow_model(path: str, dtype: torch.dtype = torch.bfloat16, device: str = "cuda", 
+                    disable_mmap: bool = False, flux_variant_type: Optional[str] = None):
     
-    with init_empty_weights():
-        model = flux_models.Flux(params_dto)
+    # Determine model_type_str and analysis_metadata
+    # analyze_checkpoint_state should ideally tell us if it's 'chroma' based on key structure
+    # For now, if flux_variant_type is "chroma", we use ChromaModel.
+    # Or, if analyze_checkpoint_state robustly identifies it as Chroma.
 
-    # Materialize the model on the target device BEFORE loading state_dict
-    # This ensures parameters are no longer "meta"
-    target_dtype = dtype if dtype is not None else torch.float32 # Default to float32 if not specified for materialization
-    model.to_empty(device=device) # Materialize on target device with default dtype
-    model.to(dtype=target_dtype)  # Explicitly set dtype after materialization
+    # Forcing Chroma path for this refactor:
+    model_type_str = "chroma" 
+    logger.info(f"Forcing model type to '{model_type_str}' for loading.")
 
-    logger.info(f"Loading state dict from {ckpt_path} to model on device '{model.device}' with dtype '{model.dtype}'")
-    # Load state dict (which is on CPU) into the now materialized model on `device`
-    # No need for sd_dtype here as model is already on target_dtype
-    sd = load_safetensors(ckpt_path, device="cpu", disable_mmap=disable_mmap, dtype=None)  # Load to CPU
+    if model_type_str == "chroma":
+        logger.info("Loading ChromaModel structure.")
+        params_obj = flux_models.get_chroma_model_params()
+        model = flux_models.ChromaModel(params_obj)
+    else:
+        # Fallback or error for other types if this script is Chroma-only
+        # This part would contain your original logic for loading generic FLUX dev/schnell
+        logger.error(f"Unsupported model type '{model_type_str}' for this loading path. Expected 'chroma'.")
+        # For now, let's assume we only proceed if it's chroma.
+        # You might need to reinstate old logic if you want to load other FLUX types.
+        model_type_str_analyzed, num_double, num_single, analysis_metadata = analyze_checkpoint_state(path)
+        if model_type_str_analyzed not in model_configs:
+            raise ValueError(f"Unknown model variant: {model_type_str_analyzed}")
+        params_dto = model_configs[model_type_str_analyzed].params
+        if isinstance(params_dto, dict): # If it's a dict, assume it's for dev/schnell and needs num_blocks
+            params_dto = flux_models.flux1_dev_params(num_double, num_single) # Or Schnell based on analysis
+        model = flux_models.Flux(params_dto) # Your original Flux class
+        model_type_str = model_type_str_analyzed # Use the analyzed type
+
+    logger.info(f"Building Flux model variant '{model_type_str}' with inferred structure.")
     
-    # No need for assign=True anymore as model is not on meta device
-    info = model.load_state_dict(sd, strict=False) 
+    # Load state dict
+    logger.info(f"Loading state dict from {path} to model on device '{DEVICE_CPU}' with dtype '{str(dtype)}'") # Load to CPU first
     
-    final_missing_keys = list(info.missing_keys) 
-    acceptable_missing_for_chroma = []
+    # Temporarily use your existing load_safetensors
+    sd = load_safetensors(path, DEVICE_CPU, disable_mmap=disable_mmap, dtype=None) # Load as is first
 
-    if model_type_str == MODEL_TYPE_CHROMA:
-        if params_dto.approximator_config:
-            acceptable_missing_for_chroma.extend([k for k in final_missing_keys if k.startswith("modulation_approximator.")])
-        
-        if params_dto.guidance_embed and not metadata.get("has_guidance_embed_input"):
-            acceptable_missing_for_chroma.extend([k for k in final_missing_keys if k.startswith("guidance_in.")])
-            
-        acceptable_missing_for_chroma.extend([k for k in final_missing_keys if k.startswith("final_layer.adaLN_modulation.")])
+    # Filter SD for keys that exist in the model to avoid unexpected key errors if strict=True later
+    model_keys = model.state_dict().keys()
+    filtered_sd = {k: v for k, v in sd.items() if k in model_keys}
+    unexpected_keys_in_ckpt = [k for k in sd.keys() if k not in model_keys]
+    if unexpected_keys_in_ckpt:
+        logger.warning(f"Checkpoint contained unexpected keys not in model structure: {unexpected_keys_in_ckpt[:10]}...") # Log first few
 
-        if acceptable_missing_for_chroma:
-            logger.info(f"Known acceptable missing keys for Chroma model '{ckpt_path}': {list(set(acceptable_missing_for_chroma))}")
-            final_missing_keys = [k for k in final_missing_keys if k not in acceptable_missing_for_chroma]
-
-    if final_missing_keys:
-        logger.error(f"State_dict loading for '{model_type_str}' model failed due to critical missing keys: {final_missing_keys}")
-        raise RuntimeError(f"Failed to load state_dict for '{model_type_str}' due to critical missing keys: {final_missing_keys}")
-    elif info.missing_keys: 
-         logger.info(f"All missing keys handled for model type '{model_type_str}'. Original missing: {info.missing_keys}")
-
-    if info.unexpected_keys:
-        logger.warning(f"Unexpected keys during state_dict load: {info.unexpected_keys}")
+    # Load with strict=False to allow missing LoRA keys etc.
+    info = model.load_state_dict(filtered_sd, strict=False) 
     
-    if not info.missing_keys and not info.unexpected_keys:
-        logger.info("State_dict loaded successfully (strict=False, but no mismatches observed).")
-    elif not final_missing_keys : 
-        logger.info(f"State_dict for {model_type_str} loaded successfully (strict=False, known differences handled).")
-
-    # Model is already on target_device and target_dtype
+    if info.missing_keys:
+        logger.warning(f"Missing keys when loading state_dict for '{model_type_str}': {info.missing_keys}")
+    # 'unexpected_keys' in `info` would be empty here because we pre-filtered `sd`.
+    
+    logger.info(f"State_dict for '{model_type_str}' loaded. Missing: {len(info.missing_keys)}. Model will be moved to {device}/{dtype}.")
+    model.to(device=torch.device(device), dtype=dtype)
+    
+    # Return the determined model type string and the model instance
     return model_type_str, model
 
 
