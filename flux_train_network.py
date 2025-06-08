@@ -646,7 +646,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         noise_scheduler,
         latents, # Original (unpacked) latents from VAE, shape [B, C, H_orig_lat, W_orig_lat]
         batch,
-        text_encoder_conds, 
+        text_encoder_conds,
         unet: flux_models.Flux, # This is the FLUX DiT model
         network, # LoRA network
         weight_dtype,
@@ -691,12 +691,12 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
 
         if args.gradient_checkpointing:
-            packed_noisy_model_input.requires_grad_(True) 
+            packed_noisy_model_input.requires_grad_(True)
             if l_pooled is not None and l_pooled.dtype.is_floating_point: l_pooled.requires_grad_(True)
             if t5_out is not None and t5_out.dtype.is_floating_point: t5_out.requires_grad_(True)
             # txt_ids and img_ids_linear are indices, should not require grad
             guidance_vec.requires_grad_(True)
-        
+
         # ... (existing debug logs for conds) ...
         logger.info(f"FLUX_TRAINER_DEBUG: img_ids_linear.shape: {img_ids_linear.shape}, img_ids_linear.ndim: {img_ids_linear.ndim}, img_ids_linear.device: {img_ids_linear.device}")
 
@@ -718,68 +718,95 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         # model_pred from DiT is in packed format: [B, NumPatches, FeaturesPerPatch]
         # e.g. [B, 1008, 64] for FLUX Chroma
         model_pred = call_dit_func(
-            packed_noisy_model_input, img_ids_linear, t5_out, txt_ids, 
-            l_pooled, 
+            packed_noisy_model_input, img_ids_linear, t5_out, txt_ids,
+            l_pooled,
             timesteps, guidance_vec, actual_t5_attn_mask_for_model,
             patch_grid_h, patch_grid_w # Pass patch grid dimensions
         )
         logger.info(f"DEBUG: model_pred (output from DiT, packed) shape: {model_pred.shape}")
 
+        # ------------- START OF REPLACEMENT -------------
+        # The model's direct output, unpacked to match original latent space.
+        model_pred_unpacked_raw_output = flux_utils.unpack_latents(model_pred.contiguous(), patch_grid_h, patch_grid_w)
+        logger.info(f"DEBUG: model_pred_unpacked_raw_output (model's direct output) shape: {model_pred_unpacked_raw_output.shape}")
 
-        # MODIFIED: Unpack model_pred to match original latent space shape
-        model_pred_unpacked = flux_utils.unpack_latents(model_pred.contiguous(), patch_grid_h, patch_grid_w)
-        logger.info(f"DEBUG: model_pred_unpacked shape: {model_pred_unpacked.shape}. Expected to match noisy_model_input: {noisy_model_input.shape}")
+        weighting = None # Default
+        noise_pred_final = model_pred_unpacked_raw_output # Alias for clarity, may be modified below
 
-        # noisy_model_input is in original latent shape [B, C_orig, H_orig_lat, W_orig_lat]
-        model_pred_unpacked, weighting = flux_train_utils.apply_model_prediction_type(args, model_pred_unpacked, noisy_model_input, sigmas)
-        
-        # Target is also in original latent shape
-        target = noise - latents 
-        logger.info(f"DEBUG: target shape: {target.shape}")
+        if args.model_prediction_type == "raw":
+            # For FLUX Rectified Flow, the model typically predicts Z = X_1 - X_0 (velocity).
+            # X_1 is pure noise ('noise'), X_0 is clean latents ('latents').
+            # The target for the loss is this Z.
+            target = noise - latents
+            # noise_pred_final is already model_pred_unpacked_raw_output, which is assumed to be the model's prediction of Z.
 
+        elif args.model_prediction_type == "sigma_scaled": # SD-style: model predicts (x_t - x_0)/sigma_diffusers_schedule
+            # apply_model_prediction_type converts raw output to an x_0 (clean image) prediction
+            noise_pred_final, weighting = flux_train_utils.apply_model_prediction_type(
+                args, model_pred_unpacked_raw_output, noisy_model_input, sigmas
+            ) # noise_pred_final is now the predicted x_0
+            target = latents # Target is the clean image x_0
 
+        elif args.model_prediction_type == "additive": # SD-style: raw_output is x_0 - x_t
+            # apply_model_prediction_type converts raw output to an x_0 (clean image) prediction
+            noise_pred_final, weighting = flux_train_utils.apply_model_prediction_type(
+                args, model_pred_unpacked_raw_output, noisy_model_input, sigmas
+            ) # noise_pred_final is now the predicted x_0
+            target = latents # Target is the clean image x_0
+        else:
+            raise ValueError(f"Unknown model_prediction_type: {args.model_prediction_type}")
+
+        logger.info(f"DEBUG: noise_pred_final shape: {noise_pred_final.shape}, target shape: {target.shape}")
+
+        # Initialize diff_output_pr_indices; it's used in the following block
+        diff_output_pr_indices = []
         if "custom_attributes" in batch:
-            diff_output_pr_indices = []
             for i, custom_attributes in enumerate(batch["custom_attributes"]):
                 if "diff_output_preservation" in custom_attributes and custom_attributes["diff_output_preservation"]:
                     diff_output_pr_indices.append(i)
 
-            if len(diff_output_pr_indices) > 0:
-                network.set_multiplier(0.0)
-                if hasattr(unet, 'prepare_block_swap_before_forward'): 
-                    unet.prepare_block_swap_before_forward() 
-                with torch.no_grad():
-                    l_pooled_prior = l_pooled[diff_output_pr_indices] if l_pooled is not None else None
-                    t5_out_prior = t5_out[diff_output_pr_indices]
-                    txt_ids_prior = txt_ids[diff_output_pr_indices]
-                    t5_attn_mask_prior = actual_t5_attn_mask_for_model[diff_output_pr_indices] if actual_t5_attn_mask_for_model is not None else None
-                    
-                    # model_pred_prior from DiT is also packed
-                    model_pred_prior = call_dit_func(
-                        packed_noisy_model_input[diff_output_pr_indices],
-                        img_ids_linear[diff_output_pr_indices],
-                        t5_out_prior,
-                        txt_ids_prior,
-                        l_pooled_prior,
-                        timesteps[diff_output_pr_indices],
-                        guidance_vec[diff_output_pr_indices] if guidance_vec is not None else None,
-                        t5_attn_mask_prior,
-                        patch_grid_h, patch_grid_w # Pass patch grid dimensions
-                    )
-                network.set_multiplier(1.0) 
-                
-                # MODIFIED: Unpack model_pred_prior
-                model_pred_prior_unpacked = flux_utils.unpack_latents(model_pred_prior.contiguous(), patch_grid_h, patch_grid_w)
-                
-                model_pred_prior_unpacked, _ = flux_train_utils.apply_model_prediction_type(
-                    args,
-                    model_pred_prior_unpacked, 
-                    noisy_model_input[diff_output_pr_indices],
-                    sigmas[diff_output_pr_indices] if sigmas is not None else None,
+        # For diff_output_preservation:
+        if "custom_attributes" in batch and len(diff_output_pr_indices) > 0:
+            network.set_multiplier(0.0) # Turn off LoRA for prior prediction
+            if hasattr(unet, 'prepare_block_swap_before_forward'):
+                unet.prepare_block_swap_before_forward()
+            with torch.no_grad():
+                l_pooled_prior = l_pooled[diff_output_pr_indices] if l_pooled is not None else None
+                t5_out_prior = t5_out[diff_output_pr_indices]
+                txt_ids_prior = txt_ids[diff_output_pr_indices]
+                t5_attn_mask_prior = actual_t5_attn_mask_for_model[diff_output_pr_indices] if actual_t5_attn_mask_for_model is not None else None
+
+                model_pred_prior_packed = call_dit_func( # Renamed to avoid confusion
+                    packed_noisy_model_input[diff_output_pr_indices],
+                    img_ids_linear[diff_output_pr_indices],
+                    t5_out_prior,
+                    txt_ids_prior,
+                    l_pooled_prior,
+                    timesteps[diff_output_pr_indices],
+                    guidance_vec[diff_output_pr_indices] if guidance_vec is not None else None,
+                    t5_attn_mask_prior,
+                    patch_grid_h, patch_grid_w
                 )
-                target[diff_output_pr_indices] = model_pred_prior_unpacked.to(target.dtype)
-        
-        return model_pred_unpacked, target, timesteps, weighting
+            network.set_multiplier(1.0) # Turn LoRA back on
+
+            model_pred_prior_unpacked_raw_output = flux_utils.unpack_latents(model_pred_prior_packed.contiguous(), patch_grid_h, patch_grid_w)
+
+            if args.model_prediction_type == "raw":
+                # model_pred_prior_unpacked_raw_output is (X_1 - X_0)_prior
+                # The target for these specific samples should become this prior (X_1 - X_0).
+                target[diff_output_pr_indices] = model_pred_prior_unpacked_raw_output.to(target.dtype)
+            elif args.model_prediction_type == "sigma_scaled" or args.model_prediction_type == "additive":
+                # Target is x_0. So, we need x_0 prediction from the prior model (without LoRA).
+                prior_x0_pred, _ = flux_train_utils.apply_model_prediction_type(
+                    args,
+                    model_pred_prior_unpacked_raw_output,
+                    noisy_model_input[diff_output_pr_indices], # Use the noisy input for these samples
+                    sigmas[diff_output_pr_indices] if sigmas is not None else None, # And corresponding sigmas
+                )
+                target[diff_output_pr_indices] = prior_x0_pred.to(target.dtype)
+        # ------------- END OF REPLACEMENT -------------
+
+        return noise_pred_final, target, timesteps, weighting
 
 
 def setup_parser() -> argparse.ArgumentParser:
