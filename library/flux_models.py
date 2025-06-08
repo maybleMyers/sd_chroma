@@ -72,7 +72,67 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
     out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
     return out.float()
+def get_chroma_model_params() -> FluxParams: # Returns the main FluxParams dataclass
+    # Configure an instance of FluxParams specifically for Chroma
+    app_config = ApproximatorParams( # n_layers is already 5 by default in ApproximatorParams
+        in_dim=64, 
+        out_dim_per_mod_vector=3072, # Should match hidden_size for Chroma's Approximator
+        hidden_dim=5120, 
+        n_layers=5, # Explicitly ensure 5 for Chroma's main modulator
+        mod_index_length=344
+    )
+    return FluxParams(
+        in_channels=64, context_in_dim=4096, hidden_size=3072,
+        mlp_ratio=4.0, num_heads=24, depth=19, depth_single_blocks=38,
+        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True,
+        # Chroma-specific settings enforced here:
+        guidance_embed=False,       # No separate guidance MLP for internal_cond_vec path
+        use_modulation=False,       # Chroma uses external Approximator via distilled_guidance_layer
+        use_distilled_guidance_layer=True, # This signifies the main Approximator is active
+        approximator_config=app_config, # Assign the configured ApproximatorParams
+        use_time_embed=False,       # No separate time MLP for internal_cond_vec path
+        use_vector_embed=False,     # No separate vector MLP for internal_cond_vec path
+        # Other fields like vec_in_dim, distilled_guidance_dim, double_block_has_main_norms
+        # will use their defaults from FluxParams or be overridden if necessary.
+        # For Chroma, they are mostly non-functional due to the above False flags.
+        double_block_has_main_norms=False # Chroma blocks have non-affine norms
+    )
 
+# Also ensure you have the other param functions if flux_utils might ever call them,
+# though for a Chroma-only setup, they might not be strictly needed by load_flow_model anymore.
+def flux1_dev_params(depth_double=19, depth_single=38) -> FluxParams:
+    # ... (definition as in your complete flux_models.py)
+    return FluxParams(in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072,
+        mlp_ratio=4.0, num_heads=24, depth=depth_double, depth_single_blocks=depth_single,
+        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True, 
+        guidance_embed=True, use_modulation=True, 
+        use_distilled_guidance_layer=False, 
+        approximator_config=None,
+        use_time_embed=True, use_vector_embed=True, 
+        double_block_has_main_norms=True)
+
+
+def flux1_schnell_params(depth_double=19, depth_single=38) -> FluxParams:
+    # ... (definition as in your complete flux_models.py)
+    return FluxParams(in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072,
+        mlp_ratio=4.0, num_heads=24, depth=depth_double, depth_single_blocks=depth_single,
+        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True, 
+        guidance_embed=False, use_modulation=True,
+        use_distilled_guidance_layer=False,
+        approximator_config=None,
+        use_time_embed=True, use_vector_embed=True, 
+        double_block_has_main_norms=True)
+
+# model_configs for flux_utils.py
+model_configs = {
+    # Storing the function itself, to be called by flux_utils
+    "dev": {"params_fn": flux1_dev_params},
+    "schnell": {"params_fn": flux1_schnell_params},
+    "chroma": {"params_fn": get_chroma_model_params} # Use the new specific getter
+}
+_original_configs_for_ae = { 
+    "default": AutoEncoderParams()
+}
 def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor, mask: Optional[Tensor]=None) -> Tensor:
     q, k = apply_rope(q, k, pe)
     x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
