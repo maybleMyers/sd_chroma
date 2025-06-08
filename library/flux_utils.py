@@ -140,12 +140,6 @@ def analyze_checkpoint_state(ckpt_path: str) -> Tuple[str, int, int, Dict[str, A
 def load_flow_model(path: str, dtype: torch.dtype = torch.bfloat16, device: str = "cuda", 
                     disable_mmap: bool = False, flux_variant_type: Optional[str] = None):
     
-    # Determine model_type_str and analysis_metadata
-    # analyze_checkpoint_state should ideally tell us if it's 'chroma' based on key structure
-    # For now, if flux_variant_type is "chroma", we use ChromaModel.
-    # Or, if analyze_checkpoint_state robustly identifies it as Chroma.
-
-    # Forcing Chroma path for this refactor:
     model_type_str = "chroma" 
     logger.info(f"Forcing model type to '{model_type_str}' for loading.")
 
@@ -153,21 +147,20 @@ def load_flow_model(path: str, dtype: torch.dtype = torch.bfloat16, device: str 
         logger.info("Loading ChromaModel structure.")
         # Assuming flux_models has get_chroma_model_params and ChromaModel
         params_obj = flux_models.get_chroma_model_params() 
-        model = flux_models.ChromaModel(params_obj)
+        model = flux_models.Flux(params_obj)
     else:
         # This part is now less relevant if we are only supporting Chroma loading here.
-        # If you need to support other FLUX types, this logic would need to be reinstated and use your original Flux class.
         logger.error(f"Attempting to load non-Chroma model type '{model_type_str}' through a Chroma-focused path. This may not be fully supported by current simplifications.")
         # Fallback to original logic if truly needed for other types, but for now, focus on Chroma
         model_type_str_analyzed, num_double, num_single, analysis_metadata = analyze_checkpoint_state(path)
-        if model_type_str_analyzed not in model_configs: # model_configs from your original flux_models
+        if model_type_str_analyzed not in flux_models.model_configs: 
             raise ValueError(f"Unknown model variant: {model_type_str_analyzed}")
         
         # This assumes model_configs and the generic Flux class are still defined for non-Chroma variants
-        params_dto_generic = model_configs[model_type_str_analyzed].params
+        params_dto_generic = flux_models.model_configs[model_type_str_analyzed].params 
         if isinstance(params_dto_generic, dict): 
             params_dto_generic = flux_models.flux1_dev_params(num_double, num_single) 
-        model = flux_models.Flux(params_dto_generic) # Your original generic Flux class
+        model = flux_models.Flux(params_dto_generic) 
         model_type_str = model_type_str_analyzed
 
 
