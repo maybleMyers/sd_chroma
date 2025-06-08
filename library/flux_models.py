@@ -769,42 +769,60 @@ class Flux(nn.Module):
         self.offloader_single.prepare_block_devices_before_forward(self.single_blocks)
     def forward(self, img: Tensor, img_ids: Tensor, txt: Tensor, txt_ids: Tensor, timesteps: Tensor,
                 y: Tensor, guidance: Tensor|None=None, txt_attention_mask: Tensor|None=None, **kwargs) -> Tensor:
-        if img.ndim!=3 or txt.ndim!=3: raise ValueError("Inputs img/txt must be 3D.")
-        img_p=self.img_in(img)
+        # img: (B, L_img_packed, D_in_img), from packed VAE output
+        # img_ids: (B, L_img_packed, 3), positional IDs for image tokens
+        # txt: (B, L_txt_seq, D_t5), T5 feature outputs
+        # txt_ids: (B, L_txt_seq), T5 vocabulary token IDs (THIS IS THE ONE MISUSED FOR pe_embedder)
+
+        if img.ndim != 3 or txt.ndim != 3: # txt is (B, L, D), img is (B, L, D)
+            raise ValueError(f"Inputs img/txt must be 3D. Got img: {img.ndim}D, txt: {txt.ndim}D")
+            
+        img_p = self.img_in(img)
         if self.distilled_guidance_layer: img_p = img_p + self.distilled_guidance_layer(img)
-        txt_f=self.txt_in(txt)
+        
+        txt_f = self.txt_in(txt) # txt_f is (B, L_txt_seq, D_hidden)
         
         int_cond_parts=[]
         if self.time_in: int_cond_parts.append(self.time_in(timestep_embedding(timesteps,256)))
-        # For Chroma, params_dto.guidance_embed is True. If self.guidance_in is nn.Identity (due to missing checkpoint keys for it), this part is skipped.
         if self.params_dto.guidance_embed and guidance is not None and not isinstance(self.guidance_in,nn.Identity):
             int_cond_parts.append(self.guidance_in(timestep_embedding(guidance,256)))
         if self.vector_in: int_cond_parts.append(self.vector_in(y))
         
-        # If all embedders are None (like for Chroma if guidance_in is also effectively None), int_cond_vec is zero.
         internal_cond_vec = sum(int_cond_parts) if int_cond_parts else \
                             torch.zeros(img.shape[0], self.hidden_size, device=img.device, dtype=img.dtype)
         
         mod_vecs_chroma=None
-        if self.modulation_approximator: # Chroma path, if approximator is built
+        if self.modulation_approximator:
             app_cfg=self.params_dto.approximator_config; _bs=img.shape[0]
-            # For Chroma, time_in and vector_in are None. Guidance_in might be Identity if keys are missing.
-            # The approximator's input should be formed from what's available.
-            # Ostris's example uses ts_emb, guidance_emb, mod_idx_emb.
-            ts_emb_approx = timestep_embedding(timesteps,16) # Approximator always gets a timestep embedding
+            ts_emb_approx = timestep_embedding(timesteps,16)
             guid_val_approx = guidance if guidance is not None else torch.zeros_like(timesteps, device=timesteps.device, dtype=timesteps.dtype)
             guid_emb_approx = timestep_embedding(guid_val_approx,16)
-            
             mod_idx_batched = self.mod_index.unsqueeze(0).repeat(_bs, 1)
-            mod_idx_emb = timestep_embedding(mod_idx_batched,32) # (B, mod_idx_length, 32)
-            
+            mod_idx_emb = timestep_embedding(mod_idx_batched,32)
             ts_guid_emb_approx = torch.cat([ts_emb_approx, guid_emb_approx], dim=1).unsqueeze(1).repeat(1,self.mod_index_length,1)
-            approx_in = torch.cat([ts_guid_emb_approx, mod_idx_emb], dim=-1) # (B, mod_idx_length, 64)
-            
+            approx_in = torch.cat([ts_guid_emb_approx, mod_idx_emb], dim=-1)
             mod_vecs=self.modulation_approximator(approx_in)
             mod_vecs_chroma=distribute_modulations_from_approximator(mod_vecs,self.num_double_blocks,self.num_single_blocks,self.params_dto)
-            
-        pe=self.pe_embedder(torch.cat((txt_ids,img_ids),dim=1))
+
+        # B: batch_size, L_txt: sequence length of text features
+        B, L_txt, _ = txt_f.shape 
+
+        txt_seq_positions = torch.arange(L_txt, device=txt_f.device, dtype=img_ids.dtype) 
+        txt_seq_positions = txt_seq_positions.unsqueeze(0).expand(B, -1) # (B, L_txt)
+
+        # 2. Expand text positional IDs to 3D to match img_ids's structure (B, L, 3_axes)
+        # We represent text 1D position as (sequence_pos, 0, 0) for the 3 axes.
+        # The specific meaning of the two zeroed axes for text is arbitrary but needed for uniform structure.
+        txt_pos_ids_3d = torch.zeros(B, L_txt, 3, device=txt_f.device, dtype=img_ids.dtype)
+        txt_pos_ids_3d[..., 0] = txt_seq_positions # Fill the first axis with sequence positions
+
+        # 3. Concatenate the 3D positional IDs for text and image tokens
+        # img_ids is already (B, L_img_packed, 3)
+        all_pos_ids = torch.cat((txt_pos_ids_3d, img_ids), dim=1) # Concatenate along sequence dimension (dim=1)
+        
+        # 4. Generate positional embeddings using the combined positional IDs
+        pe = self.pe_embedder(all_pos_ids)
+        # --- End of the fix ---
         
         current_img_features = img_p
         current_txt_features = txt_f
@@ -818,7 +836,7 @@ class Flux(nn.Module):
         sb_in=torch.cat((current_txt_features,current_img_features),dim=1)
         sb_attn_mask=None
         if txt_attention_mask is not None:
-            img_mask_sb=torch.ones(txt_attention_mask.shape[0],current_img_features.shape[1],device=txt_attention_mask.device,dtype=txt_attention_mask.dtype)
+            img_mask_sb=torch.ones(txt_attention_mask.shape[0],current_img_features.shape[1],device=txt_attention_mask.device,dtype=txt_attention_mask.dtype) # Use txt_attention_mask.dtype
             sb_attn_mask=torch.cat((txt_attention_mask,img_mask_sb),dim=1)
             
         for i,blk in enumerate(self.single_blocks):
@@ -831,10 +849,6 @@ class Flux(nn.Module):
         if self.training and self.cpu_offload_checkpointing and self.blocks_to_swap:
             img_f_final,internal_cond_vec=img_f_final.to(self.device),internal_cond_vec.to(self.device)
             
-        # Always use self.final_layer (which is LastLayer)
-        # For Chroma, internal_cond_vec will be ~zero if guidance_in is Identity (due to missing keys)
-        # and LastLayer's adaLN_modulation part will effectively be a no-op or apply minimal change.
-        # The distill_vec argument to self.final_layer is not used for Chroma based on current logic.
         img_out = self.final_layer(img_f_final, vec=internal_cond_vec, distill_vec=None)
         return img_out
 
