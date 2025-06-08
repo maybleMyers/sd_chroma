@@ -403,6 +403,27 @@ class SelfAttention(nn.Module):
 
 @dataclass
 class ModulationOut: shift: Tensor; scale: Tensor; gate: Tensor
+def log_tensor_stats(tensor: Optional[torch.Tensor], name: str = "tensor", logger_obj: Optional[logging.Logger] = None):
+    """Logs statistics of a tensor if it's not None."""
+    if logger_obj is None:
+        logger_obj = logging.getLogger(__name__) # Fallback to current module's logger
+
+    if tensor is not None:
+        # Ensure operations are safe even for 0-element tensors if they can occur
+        has_elements = tensor.numel() > 0
+        min_val = tensor.min().item() if has_elements else 'N/A (0 elements)'
+        max_val = tensor.max().item() if has_elements else 'N/A (0 elements)'
+        mean_val = tensor.mean().item() if has_elements else 'N/A (0 elements)'
+        
+        logger_obj.debug(
+            f"{name}: shape {tensor.shape}, dtype {tensor.dtype}, "
+            f"min {min_val}, "
+            f"max {max_val}, "
+            f"mean {mean_val}, "
+            f"isnan {torch.isnan(tensor).any().item()}, isinf {torch.isinf(tensor).any().item()}"
+        )
+    else:
+        logger_obj.debug(f"{name}: None")
 
 class Modulation(nn.Module):
     def __init__(self, dim: int, double: bool):
@@ -426,20 +447,24 @@ class LastLayer(nn.Module):
         # The `final_layer_custom_path` in Flux class for Chroma bypasses this LastLayer's adaLN part.
         # If Flux `final_layer_custom_path` is False (e.g. for Dev/Schnell), then vec is used.
         
-        x_normed = self.norm_final(x) # This norm has no learnable params
+        log_tensor_stats(x, "LastLayer_input_x", logger_obj=logger) # Use your log_tensor_stats helper
+        x_normed = self.norm_final(x)
+        log_tensor_stats(x_normed, "LastLayer_x_normed", logger_obj=logger)
 
-        if vec is not None and not (vec.ndim == 3 and vec.shape[1] == 1 and vec.shape[2] == self.adaLN_modulation[1].in_features and torch.all(vec == 0)): # Check if vec is not effectively zero
-            # This path is for Dev/Schnell or if Chroma somehow provides a meaningful vec
+        if vec is not None and not (vec.ndim == 3 and vec.shape[1] == 1 and vec.shape[2] == self.adaLN_modulation[1].in_features and torch.all(vec == 0)):
             mod_out = self.adaLN_modulation(vec)
             shift, scale = mod_out.chunk(2, dim=1)
             shift, scale = shift.unsqueeze(1), scale.unsqueeze(1)
             x_mod = (1 + scale) * x_normed + shift
+            log_tensor_stats(x_mod, "LastLayer_x_mod_with_adaLN", logger_obj=logger)
         else:
-            # For Chroma when final_layer_custom_path=False and vec is zero, or if distill_vec was intended for here (but it's not)
-            # Effectively, no adaLN modulation happens.
             x_mod = x_normed
+            log_tensor_stats(x_mod, "LastLayer_x_mod_no_adaLN", logger_obj=logger)
 
+        # You can also log the weight dtype of the linear layer if needed
+        # logger.debug(f"LastLayer: self.linear.weight.dtype: {self.linear.weight.dtype}")
         x_out = self.linear(x_mod)
+        log_tensor_stats(x_out, "LastLayer_x_out_FINAL", logger_obj=logger)
         return x_out
 
 class ApproximatorLayer(nn.Module): # To match Ostris/Chroma checkpoint keys

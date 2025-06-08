@@ -721,6 +721,14 @@ class NetworkTrainer:
             ds_model, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
                 *ds_model_list, optimizer, train_dataloader, val_dataloader, lr_scheduler
             ) # Unpack and repack based on what deepspeed_utils.prepare_deepspeed_model expects if it's used
+            
+            if isinstance(trainer, FluxNetworkTrainer) and hasattr(unet, 'final_layer') and hasattr(unet.final_layer, 'linear'): # Be specific
+                logger.info(f"UNET DTYPE CHECK: unet.final_layer.linear.weight.dtype: {unet.final_layer.linear.weight.dtype}")
+                if unet.final_layer.linear.bias is not None:
+                     logger.info(f"UNET DTYPE CHECK: unet.final_layer.linear.bias.dtype: {unet.final_layer.linear.bias.dtype}")
+            else:
+                logger.info(f"UNET DTYPE CHECK: Could not access unet.final_layer.linear for dtype check.")
+
             training_model = ds_model # Or the specific network model from ds_model
         else:
             if train_unet: unet = self.prepare_unet_with_accelerator(args, accelerator, unet)
