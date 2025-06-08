@@ -22,11 +22,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ApproximatorParams:
-    in_dim = 64
-    out_dim_per_mod_vector = 3072
-    hidden_dim = 5120
-    n_layers = 5
-    mod_index_length = 344
+    in_dim: int = 64
+    out_dim_per_mod_vector: int = 3072
+    hidden_dim: int = 5120
+    n_layers: int = 5
+    mod_index_length: int = 344
 
 @dataclass
 class FluxParams:
