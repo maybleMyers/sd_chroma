@@ -7,7 +7,6 @@ import random
 from typing import Any, Optional, Union
 
 import torch
-#torch.autograd.set_detect_anomaly(True)
 from accelerate import Accelerator
 from diffusers import DDPMScheduler # <--- ADD THIS IMPORT
 
@@ -42,39 +41,6 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.is_swapping_blocks: bool = False
         self.train_clip_l: bool = False  # Initialize here
         self.train_t5xxl: bool = False # Initialize here
-
-    def all_reduce_network(self, accelerator: Accelerator, network: torch.nn.Module):
-        """
-        Manually reduces gradients for the network parameters across DDP processes.
-        This is called when accelerator.sync_gradients is True.
-        Often, accelerator.backward() handles this implicitly, but an explicit
-        call might be needed for specific network types or DDP configurations.
-        """
-        if accelerator.state.num_processes > 1:
-            # Check if the network has parameters that require gradients.
-            # The `network` object here is the LoRA network.
-            # We are interested in the gradients of its trainable parameters.
-            trainable_params = [p for p in network.parameters() if p.requires_grad and p.grad is not None]
-            
-            if not trainable_params:
-                logger.debug("all_reduce_network: No trainable parameters with gradients found in the network to reduce.")
-                return
-
-            logger.debug(f"all_reduce_network: Attempting to reduce gradients for {len(trainable_params)} parameter(s)/tensor(s) in the network.")
-            
-            # It's generally safer to reduce gradients one by one if they are not part of a single contiguous block
-            # that `accelerator.backward` would handle perfectly for a simple model.
-            # For LoRA, parameters are typically distinct.
-            for param in trainable_params:
-                try:
-                    # The reduction operation should be 'mean' for gradients.
-                    param.grad = accelerator.reduce(param.grad, reduction="mean")
-                except Exception as e:
-                    logger.error(f"Error during gradient reduction for a parameter: {e}")
-                    # Optionally, re-raise or handle as appropriate
-            logger.info(f"Manually reduced network gradients across DDP processes (num_processes: {accelerator.state.num_processes}).")
-        else:
-            logger.debug("all_reduce_network: Single process, no DDP reduction needed for the network.")
 
     def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True):
         """
@@ -162,39 +128,27 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
         logger.debug("FluxNetworkTrainer: post_process_loss returning loss as is (or after parent's if flags were set).")
         return loss # Or return super().post_process_loss(loss, args, timesteps, noise_scheduler) if we want to keep parent's logic
-    
+
     def get_sai_model_spec(self, args: argparse.Namespace) -> dict:
-        # model_type_str should be set by load_target_model
-        if self.model_type_str is None:
+        # FLUX model has its own SAI model spec
+        # Use flux_utils.MODEL_TYPE_FLUX_DEV, flux_utils.MODEL_TYPE_FLUX_SCHNELL, or flux_utils.MODEL_TYPE_CHROMA
+        # self.model_type_str should be set
+        if self.model_type_str is None: # Fallback if not set, though it should be
              logger.warning("model_type_str not set in get_sai_model_spec, attempting to analyze checkpoint again.")
              if args.pretrained_model_name_or_path:
                 self.model_type_str, _, _, _ = flux_utils.analyze_checkpoint_state(args.pretrained_model_name_or_path)
-             else:
+             else: # Cannot determine type
                  logger.error("Cannot determine FLUX model type for SAI metadata as pretrained_model_name_or_path is missing.")
-                 # Fallback for the call, ensure all positional args are present
-                 return train_util.get_sai_model_spec(
-                     None,  # state_dict (or unet in other contexts)
-                     args,
-                     False, # sdxl
-                     True,  # lora (True because we are training LoRA)
-                     False, # textual_inversion
-                     is_stable_diffusion_ckpt=True, 
-                     sd3=None, # Assuming not SD3
-                     flux=MODEL_TYPE_UNKNOWN # Fallback flux type
-                 )
+                 return train_util.get_sai_model_spec(None, args, is_sdxl=False, is_stable_diffusion_ckpt=True, flux="unknown_flux_type")
 
-        # For LoRA training, 'lora' should be True. 'textual_inversion' is False.
-        # 'sdxl' is False for FLUX.
-        logger.info(f"FluxNetworkTrainer: Using flux='{self.model_type_str}' for SAI metadata (original base: {self.model_type_str}). It's a LoRA.")
+
+        # Map internal model_type_str to the SAI flux argument string if necessary,
+        # or directly use a general one like flux_utils.MODEL_TYPE_FLUX_DEV for all trained LoRAs for now.
+        # For simplicity, let's use MODEL_TYPE_FLUX_DEV as a general tag for LoRAs trained on any FLUX variant.
+        # More specific tagging could be done if needed.
+        logger.info(f"FluxNetworkTrainer: Using flux='{flux_utils.MODEL_TYPE_FLUX_DEV}' for SAI metadata (original base: {self.model_type_str}).")
         return train_util.get_sai_model_spec(
-            None,  # state_dict (or unet in other contexts, pass None if not directly needed by this func for LoRA)
-            args,
-            False,                                  # sdxl (positional)
-            True,                                   # lora (positional - True because this is a LoRA trainer)
-            False,                                  # textual_inversion (positional)
-            is_stable_diffusion_ckpt=True,          # keyword
-            sd3=None,                               # keyword (assuming not SD3 for now)
-            flux=self.model_type_str                # keyword (use the analyzed model type)
+            None, args, is_sdxl=False, is_stable_diffusion_ckpt=True, flux=flux_utils.MODEL_TYPE_FLUX_DEV # Generic tag
         )
 
     def is_text_encoder_not_needed_for_training(self, args):
@@ -639,174 +593,156 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
     def get_models_for_text_encoding(self, args, accelerator, text_encoders): # text_encoders are the original loaded models e.g. [clip_l_model_or_None, t5_model]
         return text_encoders
     
+    # ... (rest of the methods need careful review for handling optional CLIP-L) ...
+    # For example, in get_noise_pred_and_target, text_encoder_conds might have None for CLIP-L parts.
+
     def get_noise_pred_and_target(
         self,
         args,
         accelerator,
         noise_scheduler,
-        latents, # Original (unpacked) latents from VAE, shape [B, C, H_orig_lat, W_orig_lat]
+        latents,
         batch,
-        text_encoder_conds,
-        unet: flux_models.Flux, # This is the FLUX DiT model
+        text_encoder_conds, # This will be a list [clip_l_outputs_or_None, t5_outputs]
+        unet: flux_models.Flux,
         network, # LoRA network
         weight_dtype,
-        train_unet, # Flag, not the unet model itself
+        train_unet,
         is_train=True,
     ):
-        logger.info("DEBUG: Entered get_noise_pred_and_target.")
-        noise = torch.randn_like(latents) # noise matches original latent shape
+        logger.info("DEBUG: Entered get_noise_pred_and_target.") # <--- DEBUG
+        noise = torch.randn_like(latents)
         bsz = latents.shape[0]
 
-        # noisy_model_input is original latents + noise
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
             args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
         )
-        logger.info(f"DEBUG: Noisy latents (before packing for DiT input) shape: {noisy_model_input.shape}, device: {noisy_model_input.device}")
+        logger.info(f"DEBUG: Noisy latents shape: {noisy_model_input.shape}, device: {noisy_model_input.device}") # <--- DEBUG
 
-        # MODIFIED: Determine patch grid dimensions based on original latent shape
-        patch_factor = 2 # Standard for FLUX-like models where patches are 2x2 from latent space
-        patch_grid_h = noisy_model_input.shape[2] // patch_factor
-        patch_grid_w = noisy_model_input.shape[3] // patch_factor
-        logger.info(f"DEBUG: Calculated patch_grid_h={patch_grid_h}, patch_grid_w={patch_grid_w} from original latent shape {noisy_model_input.shape}")
-
-        # Pack the noisy latents for DiT input
         packed_noisy_model_input = flux_utils.pack_latents(noisy_model_input)
-        logger.info(f"DEBUG: Packed noisy latents (DiT input 'img') shape: {packed_noisy_model_input.shape}")
-
-
-        # MODIFIED: Generate linear image patch IDs
-        num_image_patches = patch_grid_h * patch_grid_w
-        img_ids_linear = torch.arange(num_image_patches, device=accelerator.device, dtype=torch.long).unsqueeze(0).repeat(bsz, 1)
-        logger.info(f"DEBUG: Generated img_ids_linear shape: {img_ids_linear.shape}")
-
-
+        packed_latent_height, packed_latent_width = noisy_model_input.shape[2] // 2, noisy_model_input.shape[3] // 2
+        img_ids = flux_utils.prepare_img_ids(bsz, packed_latent_height, packed_latent_width).to(device=accelerator.device)
         guidance_vec = torch.full((bsz,), float(args.guidance_scale), device=accelerator.device)
 
         l_pooled, t5_out, txt_ids, t5_attn_mask_from_conds = text_encoder_conds
-        # ... (moving conds to device logic) ...
-        if l_pooled is not None: l_pooled = l_pooled.to(accelerator.device, dtype=weight_dtype)
-        if t5_out is not None: t5_out = t5_out.to(accelerator.device, dtype=weight_dtype)
-        if txt_ids is not None: txt_ids = txt_ids.to(accelerator.device) # long
-        if t5_attn_mask_from_conds is not None: t5_attn_mask_from_conds = t5_attn_mask_from_conds.to(accelerator.device)
-
+        logger.info(f"DEBUG: TE conds device before move - l_pooled: {l_pooled.device if l_pooled is not None else 'None'}, t5_out: {t5_out.device if t5_out is not None else 'None'}") # <--- DEBUG
+        if l_pooled is not None:
+            l_pooled = l_pooled.to(accelerator.device, dtype=weight_dtype)
+        if t5_out is not None:
+            t5_out = t5_out.to(accelerator.device, dtype=weight_dtype)
+        if txt_ids is not None:
+            txt_ids = txt_ids.to(accelerator.device) # token ids are long/int, not float
+        if t5_attn_mask_from_conds is not None:
+            t5_attn_mask_from_conds = t5_attn_mask_from_conds.to(accelerator.device)
 
         if args.gradient_checkpointing:
-            packed_noisy_model_input.requires_grad_(True)
-            if l_pooled is not None and l_pooled.dtype.is_floating_point: l_pooled.requires_grad_(True)
-            if t5_out is not None and t5_out.dtype.is_floating_point: t5_out.requires_grad_(True)
-            # txt_ids and img_ids_linear are indices, should not require grad
+            packed_noisy_model_input.requires_grad_(True) 
+            # Re-check text_encoder_conds after they have been potentially moved to GPU and assigned
+            if l_pooled is not None and l_pooled.dtype.is_floating_point:
+                 l_pooled.requires_grad_(True)
+            if t5_out is not None and t5_out.dtype.is_floating_point:
+                 t5_out.requires_grad_(True)
+            if txt_ids is not None and txt_ids.dtype.is_floating_point: # Unlikely but safe check
+                 txt_ids.requires_grad_(True) 
+            logger.info(f"DEBUG: TE conds device after move - l_pooled: {l_pooled.device if l_pooled is not None else 'None'}, t5_out: {t5_out.device if t5_out is not None else 'None'}")
+            # +++ ADD SHAPE LOGGING +++
+            logger.info(f"DEBUG: txt_ids (shape, ndim, dtype): {txt_ids.shape if txt_ids is not None else 'None'}, {txt_ids.ndim if txt_ids is not None else 'None'}, {txt_ids.dtype if txt_ids is not None else 'None'}")
+            logger.info(f"DEBUG: img_ids (shape, ndim, dtype): {img_ids.shape if img_ids is not None else 'None'}, {img_ids.ndim if img_ids is not None else 'None'}, {img_ids.dtype if img_ids is not None else 'None'}")
+            # Ensure txt_ids is 2D for concatenation with img_ids
+            if txt_ids is not None and txt_ids.ndim == 3 and txt_ids.shape[1] == 1:
+                logger.info(f"DEBUG: Squeezing txt_ids from {txt_ids.shape} to 2D before UNet call.")
+                txt_ids = txt_ids.squeeze(1)
+                logger.info(f"DEBUG: txt_ids after squeeze (shape, ndim): {txt_ids.shape}, {txt_ids.ndim}")            
+            logger.info(f"DEBUG: t5_out (txt) (shape, ndim, dtype): {t5_out.shape if t5_out is not None else 'None'}, {t5_out.ndim if t5_out is not None else 'None'}, {t5_out.dtype if t5_out is not None else 'None'}")            
+            img_ids.requires_grad_(True)
             guidance_vec.requires_grad_(True)
+        # +++ START OF CRITICAL DEBUG LOGGING +++
+        logger.info("FLUX_TRAINER_DEBUG: --- Before calling call_dit_func ---")
+        if l_pooled is not None:
+            logger.info(f"FLUX_TRAINER_DEBUG: l_pooled.shape: {l_pooled.shape}, l_pooled.ndim: {l_pooled.ndim}, l_pooled.device: {l_pooled.device}")
+        else:
+            logger.info("FLUX_TRAINER_DEBUG: l_pooled is None")
 
-        # ... (existing debug logs for conds) ...
-        logger.info(f"FLUX_TRAINER_DEBUG: img_ids_linear.shape: {img_ids_linear.shape}, img_ids_linear.ndim: {img_ids_linear.ndim}, img_ids_linear.device: {img_ids_linear.device}")
+        if t5_out is not None: # This is 'txt' for the model
+            logger.info(f"FLUX_TRAINER_DEBUG: t5_out (txt).shape: {t5_out.shape}, t5_out.ndim: {t5_out.ndim}, t5_out.device: {t5_out.device}")
+        else:
+            logger.info("FLUX_TRAINER_DEBUG: t5_out (txt) is None")
+            
+        if txt_ids is not None: # This is 'txt_ids' for the model
+            logger.info(f"FLUX_TRAINER_DEBUG: txt_ids.shape: {txt_ids.shape}, txt_ids.ndim: {txt_ids.ndim}, txt_ids.device: {txt_ids.device}")
+        else:
+            logger.info("FLUX_TRAINER_DEBUG: txt_ids is None")
 
+        if img_ids is not None: # This is 'img_ids' for the model
+            logger.info(f"FLUX_TRAINER_DEBUG: img_ids.shape: {img_ids.shape}, img_ids.ndim: {img_ids.ndim}, img_ids.device: {img_ids.device}")
+        else:
+            logger.info("FLUX_TRAINER_DEBUG: img_ids is None")
+            
+        if t5_attn_mask_from_conds is not None: # This is 'txt_attention_mask' for the model
+             logger.info(f"FLUX_TRAINER_DEBUG: t5_attn_mask_from_conds.shape: {t5_attn_mask_from_conds.shape}, t5_attn_mask_from_conds.ndim: {t5_attn_mask_from_conds.ndim}, t5_attn_mask_from_conds.device: {t5_attn_mask_from_conds.device}")
+        else:
+            logger.info("FLUX_TRAINER_DEBUG: t5_attn_mask_from_conds is None")
+        # +++ END OF CRITICAL DEBUG LOGGING +++        
         actual_t5_attn_mask_for_model = t5_attn_mask_from_conds if args.apply_t5_attn_mask else None
 
-        # MODIFIED: Add patch_grid_h, patch_grid_w to call_dit_func
-        def call_dit_func(img_in, img_ids_in, txt_in, txt_ids_in, y_in, timesteps_in, guidance_in, txt_attention_mask_in, pgh, pgw):
+        def call_dit_func(img_in, img_ids_in, txt_in, txt_ids_in, y_in, timesteps_in, guidance_in, txt_attention_mask_in):
             with torch.set_grad_enabled(is_train), accelerator.autocast():
                 logger.info("DEBUG: Calling unet.forward()...")
-                # unet is the FLUX DiT model
                 model_pred_out = unet(
                     img=img_in, img_ids=img_ids_in, txt=txt_in, txt_ids=txt_ids_in, y=y_in,
                     timesteps=timesteps_in / 1000, guidance=guidance_in, txt_attention_mask=txt_attention_mask_in,
-                    patch_grid_h=pgh, patch_grid_w=pgw, # Pass patch grid dimensions
                 )
-                logger.info("DEBUG: unet.forward() returned.")
+                logger.info("DEBUG: unet.forward() returned.") # <--- DEBUG
             return model_pred_out
 
-        # model_pred from DiT is in packed format: [B, NumPatches, FeaturesPerPatch]
-        # e.g. [B, 1008, 64] for FLUX Chroma
         model_pred = call_dit_func(
-            packed_noisy_model_input, img_ids_linear, t5_out, txt_ids,
-            l_pooled,
+            packed_noisy_model_input, img_ids, t5_out, txt_ids, 
+            l_pooled, # This will be None for Chroma if CLIP-L is not used. Flux model needs to handle.
             timesteps, guidance_vec, actual_t5_attn_mask_for_model,
-            patch_grid_h, patch_grid_w # Pass patch grid dimensions
         )
-        logger.info(f"DEBUG: model_pred (output from DiT, packed) shape: {model_pred.shape}")
 
-        # ------------- START OF REPLACEMENT -------------
-        # The model's direct output, unpacked to match original latent space.
-        model_pred_unpacked_raw_output = flux_utils.unpack_latents(model_pred.contiguous(), patch_grid_h, patch_grid_w)
-        logger.info(f"DEBUG: model_pred_unpacked_raw_output (model's direct output) shape: {model_pred_unpacked_raw_output.shape}")
+        model_pred = flux_utils.unpack_latents(model_pred, packed_latent_height, packed_latent_width)
+        model_pred, weighting = flux_train_utils.apply_model_prediction_type(args, model_pred, noisy_model_input, sigmas)
+        target = noise - latents
 
-        weighting = None # Default
-        noise_pred_final = model_pred_unpacked_raw_output # Alias for clarity, may be modified below
-
-        if args.model_prediction_type == "raw":
-            # For FLUX Rectified Flow, the model typically predicts Z = X_1 - X_0 (velocity).
-            # X_1 is pure noise ('noise'), X_0 is clean latents ('latents').
-            # The target for the loss is this Z.
-            target = noise - latents
-            # noise_pred_final is already model_pred_unpacked_raw_output, which is assumed to be the model's prediction of Z.
-
-        elif args.model_prediction_type == "sigma_scaled": # SD-style: model predicts (x_t - x_0)/sigma_diffusers_schedule
-            # apply_model_prediction_type converts raw output to an x_0 (clean image) prediction
-            noise_pred_final, weighting = flux_train_utils.apply_model_prediction_type(
-                args, model_pred_unpacked_raw_output, noisy_model_input, sigmas
-            ) # noise_pred_final is now the predicted x_0
-            target = latents # Target is the clean image x_0
-
-        elif args.model_prediction_type == "additive": # SD-style: raw_output is x_0 - x_t
-            # apply_model_prediction_type converts raw output to an x_0 (clean image) prediction
-            noise_pred_final, weighting = flux_train_utils.apply_model_prediction_type(
-                args, model_pred_unpacked_raw_output, noisy_model_input, sigmas
-            ) # noise_pred_final is now the predicted x_0
-            target = latents # Target is the clean image x_0
-        else:
-            raise ValueError(f"Unknown model_prediction_type: {args.model_prediction_type}")
-
-        logger.info(f"DEBUG: noise_pred_final shape: {noise_pred_final.shape}, target shape: {target.shape}")
-
-        # Initialize diff_output_pr_indices; it's used in the following block
-        diff_output_pr_indices = []
+        # ... (diff_output_pr_indices logic seems okay, assumes text_encoder_conds has the right structure) ...
         if "custom_attributes" in batch:
+            diff_output_pr_indices = []
             for i, custom_attributes in enumerate(batch["custom_attributes"]):
                 if "diff_output_preservation" in custom_attributes and custom_attributes["diff_output_preservation"]:
                     diff_output_pr_indices.append(i)
 
-        # For diff_output_preservation:
-        if "custom_attributes" in batch and len(diff_output_pr_indices) > 0:
-            network.set_multiplier(0.0) # Turn off LoRA for prior prediction
-            if hasattr(unet, 'prepare_block_swap_before_forward'):
-                unet.prepare_block_swap_before_forward()
-            with torch.no_grad():
-                l_pooled_prior = l_pooled[diff_output_pr_indices] if l_pooled is not None else None
-                t5_out_prior = t5_out[diff_output_pr_indices]
-                txt_ids_prior = txt_ids[diff_output_pr_indices]
-                t5_attn_mask_prior = actual_t5_attn_mask_for_model[diff_output_pr_indices] if actual_t5_attn_mask_for_model is not None else None
+            if len(diff_output_pr_indices) > 0:
+                network.set_multiplier(0.0)
+                unet.prepare_block_swap_before_forward() # ensure this is called if blocks are swapped
+                with torch.no_grad():
+                    # Select the corresponding parts of text_encoder_conds
+                    l_pooled_prior = l_pooled[diff_output_pr_indices] if l_pooled is not None else None
+                    t5_out_prior = t5_out[diff_output_pr_indices]
+                    txt_ids_prior = txt_ids[diff_output_pr_indices]
+                    t5_attn_mask_prior = actual_t5_attn_mask_for_model[diff_output_pr_indices] if actual_t5_attn_mask_for_model is not None else None
+                    
+                    model_pred_prior = call_dit_func(
+                        packed_noisy_model_input[diff_output_pr_indices],
+                        img_ids[diff_output_pr_indices],
+                        t5_out_prior,
+                        txt_ids_prior,
+                        l_pooled_prior,
+                        timesteps[diff_output_pr_indices],
+                        guidance_vec[diff_output_pr_indices] if guidance_vec is not None else None,
+                        t5_attn_mask_prior,
+                    )
+                network.set_multiplier(1.0) 
 
-                model_pred_prior_packed = call_dit_func( # Renamed to avoid confusion
-                    packed_noisy_model_input[diff_output_pr_indices],
-                    img_ids_linear[diff_output_pr_indices],
-                    t5_out_prior,
-                    txt_ids_prior,
-                    l_pooled_prior,
-                    timesteps[diff_output_pr_indices],
-                    guidance_vec[diff_output_pr_indices] if guidance_vec is not None else None,
-                    t5_attn_mask_prior,
-                    patch_grid_h, patch_grid_w
-                )
-            network.set_multiplier(1.0) # Turn LoRA back on
-
-            model_pred_prior_unpacked_raw_output = flux_utils.unpack_latents(model_pred_prior_packed.contiguous(), patch_grid_h, patch_grid_w)
-
-            if args.model_prediction_type == "raw":
-                # model_pred_prior_unpacked_raw_output is (X_1 - X_0)_prior
-                # The target for these specific samples should become this prior (X_1 - X_0).
-                target[diff_output_pr_indices] = model_pred_prior_unpacked_raw_output.to(target.dtype)
-            elif args.model_prediction_type == "sigma_scaled" or args.model_prediction_type == "additive":
-                # Target is x_0. So, we need x_0 prediction from the prior model (without LoRA).
-                prior_x0_pred, _ = flux_train_utils.apply_model_prediction_type(
+                model_pred_prior = flux_utils.unpack_latents(model_pred_prior, packed_latent_height, packed_latent_width)
+                model_pred_prior, _ = flux_train_utils.apply_model_prediction_type(
                     args,
-                    model_pred_prior_unpacked_raw_output,
-                    noisy_model_input[diff_output_pr_indices], # Use the noisy input for these samples
-                    sigmas[diff_output_pr_indices] if sigmas is not None else None, # And corresponding sigmas
+                    model_pred_prior,
+                    noisy_model_input[diff_output_pr_indices],
+                    sigmas[diff_output_pr_indices] if sigmas is not None else None,
                 )
-                target[diff_output_pr_indices] = prior_x0_pred.to(target.dtype)
-        # ------------- END OF REPLACEMENT -------------
-
-        return noise_pred_final, target, timesteps, weighting
+                target[diff_output_pr_indices] = model_pred_prior.to(target.dtype)
+        return model_pred, target, timesteps, weighting
 
 
 def setup_parser() -> argparse.ArgumentParser:

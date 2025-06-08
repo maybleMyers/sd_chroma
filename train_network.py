@@ -1633,12 +1633,6 @@ class NetworkTrainer:
                     )
 
                     accelerator.backward(loss)
-                    if torch.isnan(loss).any() or torch.isinf(loss).any():
-                        logger.error(f"Loss is NaN or Inf at global_step {global_step} before optimizer step!")
-                        for name, param in accelerator.unwrap_model(network).named_parameters():
-                            if param.grad is not None:
-                                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                                    logger.error(f"NaN/Inf gradient in parameter: {name}")
                     if accelerator.sync_gradients:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         if args.max_grad_norm != 0.0:
