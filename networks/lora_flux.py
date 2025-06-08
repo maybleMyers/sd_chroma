@@ -1,44 +1,76 @@
-# networks.lora_flux.py
+# temporary minimum implementation of LoRA
+# FLUX doesn't have Conv2d, so we ignore it
+# TODO commonize with the original implementation
+
+# LoRA network module
+# reference:
+# https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
+# https://github.com/cloneofsimo/lora/blob/master/lora_diffusion/lora.py
+
 import math
 import os
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Type, Union
-# from diffusers import AutoencoderKL # Not directly used in LoRAModule
-# from transformers import CLIPTextModel # Not directly used in LoRAModule
-import numpy as np # Not directly used in LoRAModule forward but might be in other parts
+from diffusers import AutoencoderKL
+from transformers import CLIPTextModel
+import numpy as np
 import torch
 from torch import Tensor
 import re
-# from library.utils import setup_logging # setup_logging is usually called once globally
-# from library.sdxl_original_unet import SdxlUNet2DConditionModel # Not used here
+from library.utils import setup_logging
+from library.sdxl_original_unet import SdxlUNet2DConditionModel
 
-# setup_logging() # This might reconfigure if called multiple times, ensure it's handled correctly
+setup_logging()
 import logging
-logger_lora = logging.getLogger("networks.lora_flux") #
 
-def log_tensor_stats(tensor: Optional[torch.Tensor], name: str = "tensor", logger_obj: Optional[logging.Logger] = None):
-    if logger_obj is None:
-        logger_obj = logging.getLogger("networks.lora_flux.tensor_stats") # Fallback logger
-
-    if tensor is not None:
-        has_elements = tensor.numel() > 0
-        min_val = tensor.min().item() if has_elements and not torch.isnan(tensor).all() and not torch.isinf(tensor).all() else 'N/A' # Handle all NaN/Inf
-        max_val = tensor.max().item() if has_elements and not torch.isnan(tensor).all() and not torch.isinf(tensor).all() else 'N/A'
-        mean_val = tensor.mean().item() if has_elements and not torch.isnan(tensor).all() and not torch.isinf(tensor).all() else 'N/A'
-        
-        logger_obj.debug(
-            f"{name}: shape {tensor.shape}, dtype {tensor.dtype}, "
-            f"min {min_val}, "
-            f"max {max_val}, "
-            f"mean {mean_val}, "
-            f"isnan {torch.isnan(tensor).any().item()}, isinf {torch.isinf(tensor).any().item()}"
-        )
-    else:
-        logger_obj.debug(f"{name}: None")
+logger = logging.getLogger(__name__)
+logger_lora = logging.getLogger("networks.lora_flux")
 
 NUM_DOUBLE_BLOCKS = 19
 NUM_SINGLE_BLOCKS = 38
 
+def log_tensor_stats(tensor: Optional[torch.Tensor], name: str = "tensor", logger_obj: Optional[logging.Logger] = None):
+    if logger_obj is None:
+        logger_obj = logging.getLogger("networks.lora_flux.tensor_stats") 
+
+    if tensor is not None:
+        has_elements = tensor.numel() > 0
+        # Safely compute stats, handling cases where tensor might be all NaNs or Infs after an op
+        is_all_nan = torch.isnan(tensor).all().item() if has_elements else False
+        is_all_inf = torch.isinf(tensor).all().item() if has_elements else False
+        
+        min_val_str = 'N/A'
+        max_val_str = 'N/A'
+        mean_val_str = 'N/A'
+
+        if has_elements and not is_all_nan and not is_all_inf:
+            try:
+                # Filter out NaNs/Infs for min/max/mean if only some elements are bad
+                finite_tensor = tensor[torch.isfinite(tensor)]
+                if finite_tensor.numel() > 0:
+                    min_val_str = f"{finite_tensor.min().item():.4e}"
+                    max_val_str = f"{finite_tensor.max().item():.4e}"
+                    mean_val_str = f"{finite_tensor.mean().item():.4e}"
+                else: # All elements were NaN/Inf if finite_tensor is empty
+                    min_val_str = 'N/A (all NaN/Inf)'
+                    max_val_str = 'N/A (all NaN/Inf)'
+                    mean_val_str = 'N/A (all NaN/Inf)'
+            except Exception: # Catch any other error during stat computation
+                pass
+        elif is_all_nan:
+            min_val_str, max_val_str, mean_val_str = 'All NaN', 'All NaN', 'All NaN'
+        elif is_all_inf:
+            min_val_str, max_val_str, mean_val_str = 'All Inf', 'All Inf', 'All Inf'
+
+        logger_obj.debug(
+            f"{name}: shape {tensor.shape}, dtype {tensor.dtype}, "
+            f"min {min_val_str}, "
+            f"max {max_val_str}, "
+            f"mean {mean_val_str}, "
+            f"isnan {torch.isnan(tensor).any().item()}, isinf {torch.isinf(tensor).any().item()}"
+        )
+    else:
+        logger_obj.debug(f"{name}: None")
 
 class LoRAModule(torch.nn.Module):
     """
@@ -133,71 +165,56 @@ class LoRAModule(torch.nn.Module):
 
         del self.org_module
 
-
+    # Inside class LoRAModule in networks/lora_flux.py:
     def forward(self, x):
         # Determine if this is a LoRA module we want to debug in detail
-        # For example, the first qkv layer of the first double block
-        TARGET_LORA_TO_DEBUG = "lora_unet_double_blocks_0_img_attn_qkv" # Adjust as needed, or log for all
-        # Or, more generally, any LoRA in the first double block:
-        is_first_double_block_lora = "double_blocks_0" in self.lora_name
+        is_block_0_lora = "double_blocks_0" in self.lora_name or "single_blocks_0" in self.lora_name # Log any lora in block 0
+        # TARGET_LORA_TO_DEBUG = "lora_unet_double_blocks_0_img_attn_qkv" # Or be more specific
 
-        if is_first_double_block_lora:
+        if is_block_0_lora: # self.lora_name == TARGET_LORA_TO_DEBUG:
              log_tensor_stats(x, f"INPUT_X ({self.lora_name})", logger_obj=logger_lora)
 
         org_forwarded = self.org_forward(x)
 
-        if is_first_double_block_lora:
+        if is_block_0_lora: # self.lora_name == TARGET_LORA_TO_DEBUG:
              log_tensor_stats(org_forwarded, f"ORG_FORWARDED ({self.lora_name})", logger_obj=logger_lora)
         
-        # module dropout
         if self.module_dropout is not None and self.training:
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
-        current_scale_val = self.scale # Default scale
+        current_scale_val = self.scale 
 
         if self.split_dims is None:
-            lx_after_down = self.lora_down(x)
-            if is_first_double_block_lora:
+            lx_after_down = self.lora_down(x) 
+            if is_block_0_lora: # self.lora_name == TARGET_LORA_TO_DEBUG:
                 log_tensor_stats(lx_after_down, f"LX_DOWN ({self.lora_name})", logger_obj=logger_lora)
                 log_tensor_stats(self.lora_down.weight, f"LORA_DOWN_WEIGHT ({self.lora_name})", logger_obj=logger_lora)
 
-
             lx_processed = lx_after_down
-            # normal dropout
             if self.dropout is not None and self.training:
                 lx_processed = torch.nn.functional.dropout(lx_processed, p=self.dropout)
-
-            # rank dropout
             if self.rank_dropout is not None and self.training:
                 mask = torch.rand((lx_processed.size(0), self.lora_dim), device=lx_processed.device) > self.rank_dropout
-                if len(lx_processed.size()) == 3:
-                    mask = mask.unsqueeze(1)
-                elif len(lx_processed.size()) == 4:
-                    mask = mask.unsqueeze(-1).unsqueeze(-1)
+                if len(lx_processed.size()) == 3: mask = mask.unsqueeze(1)
+                elif len(lx_processed.size()) == 4: mask = mask.unsqueeze(-1).unsqueeze(-1)
                 lx_processed = lx_processed * mask
                 current_scale_val = self.scale * (1.0 / (1.0 - self.rank_dropout))
             
-            if is_first_double_block_lora and (self.dropout is not None or self.rank_dropout is not None) : # Log if processed
+            if is_block_0_lora and (self.dropout is not None or self.rank_dropout is not None):
                 log_tensor_stats(lx_processed, f"LX_PROCESSED_POST_DROPOUT ({self.lora_name})", logger_obj=logger_lora)
 
-
             lx_after_up = self.lora_up(lx_processed)
-            if is_first_double_block_lora:
+            if is_block_0_lora: # self.lora_name == TARGET_LORA_TO_DEBUG:
                 log_tensor_stats(lx_after_up, f"LX_UP ({self.lora_name})", logger_obj=logger_lora)
                 log_tensor_stats(self.lora_up.weight, f"LORA_UP_WEIGHT ({self.lora_name})", logger_obj=logger_lora)
 
-
             lora_delta = lx_after_up * self.multiplier * current_scale_val
-            if is_first_double_block_lora:
+            if is_block_0_lora: # self.lora_name == TARGET_LORA_TO_DEBUG:
                 log_tensor_stats(lora_delta, f"LORA_DELTA ({self.lora_name})", logger_obj=logger_lora)
-                logger_lora.debug(f"LoRA {self.lora_name} current_scale_val: {current_scale_val}, multiplier: {self.multiplier}")
+                logger_lora.debug(f"LoRA {self.lora_name} current_scale_val: {current_scale_val}, multiplier: {self.multiplier}, alpha: {self.alpha.item() if isinstance(self.alpha, torch.Tensor) else self.alpha}, rank: {self.lora_dim}")
 
-
-            # LoRA Gradient-Guided Perturbation Optimization
             if self.training and self.ggpo_sigma is not None and self.ggpo_beta is not None and self.combined_weight_norms is not None and self.grad_norms is not None:
-                # ... (GGPO logic - ensure inputs here are also checked if GGPO is active and suspected) ...
-                # This path is not taken in your current command.
                 with torch.no_grad():
                     perturbation_scale = (self.ggpo_sigma * torch.sqrt(self.combined_weight_norms ** 2)) + (self.ggpo_beta * (self.grad_norms ** 2))
                     perturbation_scale_factor = (perturbation_scale * self.perturbation_norm_factor).to(self.device)
@@ -208,44 +225,35 @@ class LoRAModule(torch.nn.Module):
             else:
                 final_output = org_forwarded + lora_delta
             
-            if is_first_double_block_lora:
+            if is_block_0_lora: # self.lora_name == TARGET_LORA_TO_DEBUG:
                 log_tensor_stats(final_output, f"FINAL_OUTPUT ({self.lora_name})", logger_obj=logger_lora)
                 if torch.isnan(final_output).any():
                      logger_lora.error(f"NAN DETECTED IN LoRA MODULE: {self.lora_name} at FINAL_OUTPUT")
-
             return final_output
         else: # split_dims path
-            # Add similar detailed logging here if self.split_dims is ever True
-            lxs_down = [lora_down_i(x) for lora_down_i in self.lora_down] # Renamed loop var
-
+            lxs_down = [lora_down_i(x) for lora_down_i in self.lora_down]
+            # ... (add detailed logging for split_dims path if it's ever taken and suspected)
             lxs_processed = lxs_down
             if self.dropout is not None and self.training:
-                lxs_processed = [torch.nn.functional.dropout(lx_p, p=self.dropout) for lx_p in lxs_processed] # Renamed loop var
-
+                lxs_processed = [torch.nn.functional.dropout(lx_p, p=self.dropout) for lx_p in lxs_processed]
             if self.rank_dropout is not None and self.training:
-                # ... (rank dropout logic for split_dims) ...
-                # This part would also need logging if active
                 masks = [torch.rand((lx_p.size(0), self.lora_dim), device=lx_p.device) > self.rank_dropout for lx_p in lxs_processed]
-                for i in range(len(lxs_processed)):
-                    if len(lxs_processed[i].size()) == 3: masks[i] = masks[i].unsqueeze(1)
-                    elif len(lxs_processed[i].size()) == 4: masks[i] = masks[i].unsqueeze(-1).unsqueeze(-1)
-                    lxs_processed[i] = lxs_processed[i] * masks[i]
+                for i_mask in range(len(lxs_processed)): # Renamed loop variable
+                    if len(lxs_processed[i_mask].size()) == 3: masks[i_mask] = masks[i_mask].unsqueeze(1)
+                    elif len(lxs_processed[i_mask].size()) == 4: masks[i_mask] = masks[i_mask].unsqueeze(-1).unsqueeze(-1)
+                    lxs_processed[i_mask] = lxs_processed[i_mask] * masks[i_mask]
                 current_scale_val = self.scale * (1.0 / (1.0 - self.rank_dropout))
             else:
                 current_scale_val = self.scale
-
-            lxs_up = [lora_up_i(lx_p) for lora_up_i, lx_p in zip(self.lora_up, lxs_processed)] # Renamed loop vars
-
+            lxs_up = [lora_up_i(lx_p) for lora_up_i, lx_p in zip(self.lora_up, lxs_processed)]
             lora_delta_cat = torch.cat(lxs_up, dim=-1) * self.multiplier * current_scale_val
             final_output = org_forwarded + lora_delta_cat
-            
             # Add logging for split_dims path if it's taken and suspected
-            # if "double_blocks_0" in self.lora_name and self.split_dims:
-            #    log_tensor_stats(lora_delta_cat, f"LORA_DELTA_CAT ({self.lora_name})", logger_obj=logger_lora)
-            #    log_tensor_stats(final_output, f"FINAL_OUTPUT_SPLIT ({self.lora_name})", logger_obj=logger_lora)
-            #    if torch.isnan(final_output).any():
-            #         logger_lora.error(f"NAN DETECTED IN LoRA MODULE (split_dims): {self.lora_name} at FINAL_OUTPUT_SPLIT")
-
+            if is_block_0_lora and self.split_dims:
+               log_tensor_stats(lora_delta_cat, f"LORA_DELTA_CAT_SPLIT ({self.lora_name})", logger_obj=logger_lora)
+               log_tensor_stats(final_output, f"FINAL_OUTPUT_SPLIT ({self.lora_name})", logger_obj=logger_lora)
+               if torch.isnan(final_output).any():
+                    logger_lora.error(f"NAN DETECTED IN LoRA MODULE (split_dims): {self.lora_name} at FINAL_OUTPUT_SPLIT")
             return final_output
 
     @torch.no_grad()
