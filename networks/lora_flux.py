@@ -25,7 +25,26 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+def log_tensor_stats(tensor: Optional[torch.Tensor], name: str = "tensor", logger_obj: Optional[logging.Logger] = None):
+    if logger_obj is None:
+        logger_obj = logging.getLogger("networks.lora_flux.tensor_stats") # Fallback logger
 
+    if tensor is not None:
+        has_elements = tensor.numel() > 0
+        min_val = tensor.min().item() if has_elements and not torch.isnan(tensor).all() and not torch.isinf(tensor).all() else 'N/A' # Handle all NaN/Inf
+        max_val = tensor.max().item() if has_elements and not torch.isnan(tensor).all() and not torch.isinf(tensor).all() else 'N/A'
+        mean_val = tensor.mean().item() if has_elements and not torch.isnan(tensor).all() and not torch.isinf(tensor).all() else 'N/A'
+        
+        logger_obj.debug(
+            f"{name}: shape {tensor.shape}, dtype {tensor.dtype}, "
+            f"min {min_val}, "
+            f"max {max_val}, "
+            f"mean {mean_val}, "
+            f"isnan {torch.isnan(tensor).any().item()}, isinf {torch.isinf(tensor).any().item()}"
+        )
+    else:
+        logger_obj.debug(f"{name}: None")
+        
 NUM_DOUBLE_BLOCKS = 19
 NUM_SINGLE_BLOCKS = 38
 
@@ -123,74 +142,120 @@ class LoRAModule(torch.nn.Module):
 
         del self.org_module
 
+
     def forward(self, x):
+        # Determine if this is a LoRA module we want to debug in detail
+        # For example, the first qkv layer of the first double block
+        TARGET_LORA_TO_DEBUG = "lora_unet_double_blocks_0_img_attn_qkv" # Adjust as needed, or log for all
+        # Or, more generally, any LoRA in the first double block:
+        is_first_double_block_lora = "double_blocks_0" in self.lora_name
+
+        if is_first_double_block_lora:
+             log_tensor_stats(x, f"INPUT_X ({self.lora_name})", logger_obj=logger_lora)
+
         org_forwarded = self.org_forward(x)
+
+        if is_first_double_block_lora:
+             log_tensor_stats(org_forwarded, f"ORG_FORWARDED ({self.lora_name})", logger_obj=logger_lora)
         
         # module dropout
         if self.module_dropout is not None and self.training:
             if torch.rand(1) < self.module_dropout:
                 return org_forwarded
 
-        if self.split_dims is None:
-            lx = self.lora_down(x)
+        current_scale_val = self.scale # Default scale
 
+        if self.split_dims is None:
+            lx_after_down = self.lora_down(x)
+            if is_first_double_block_lora:
+                log_tensor_stats(lx_after_down, f"LX_DOWN ({self.lora_name})", logger_obj=logger_lora)
+                log_tensor_stats(self.lora_down.weight, f"LORA_DOWN_WEIGHT ({self.lora_name})", logger_obj=logger_lora)
+
+
+            lx_processed = lx_after_down
             # normal dropout
             if self.dropout is not None and self.training:
-                lx = torch.nn.functional.dropout(lx, p=self.dropout)
+                lx_processed = torch.nn.functional.dropout(lx_processed, p=self.dropout)
 
             # rank dropout
             if self.rank_dropout is not None and self.training:
-                mask = torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout
-                if len(lx.size()) == 3:
-                    mask = mask.unsqueeze(1)  # for Text Encoder
-                elif len(lx.size()) == 4:
-                    mask = mask.unsqueeze(-1).unsqueeze(-1)  # for Conv2d
-                lx = lx * mask
+                mask = torch.rand((lx_processed.size(0), self.lora_dim), device=lx_processed.device) > self.rank_dropout
+                if len(lx_processed.size()) == 3:
+                    mask = mask.unsqueeze(1)
+                elif len(lx_processed.size()) == 4:
+                    mask = mask.unsqueeze(-1).unsqueeze(-1)
+                lx_processed = lx_processed * mask
+                current_scale_val = self.scale * (1.0 / (1.0 - self.rank_dropout))
+            
+            if is_first_double_block_lora and (self.dropout is not None or self.rank_dropout is not None) : # Log if processed
+                log_tensor_stats(lx_processed, f"LX_PROCESSED_POST_DROPOUT ({self.lora_name})", logger_obj=logger_lora)
 
-                # scaling for rank dropout: treat as if the rank is changed
-                # maskから計算することも考えられるが、augmentation的な効果を期待してrank_dropoutを用いる
-                scale = self.scale * (1.0 / (1.0 - self.rank_dropout))  # redundant for readability
-            else:
-                scale = self.scale
 
-            lx = self.lora_up(lx)
+            lx_after_up = self.lora_up(lx_processed)
+            if is_first_double_block_lora:
+                log_tensor_stats(lx_after_up, f"LX_UP ({self.lora_name})", logger_obj=logger_lora)
+                log_tensor_stats(self.lora_up.weight, f"LORA_UP_WEIGHT ({self.lora_name})", logger_obj=logger_lora)
+
+
+            lora_delta = lx_after_up * self.multiplier * current_scale_val
+            if is_first_double_block_lora:
+                log_tensor_stats(lora_delta, f"LORA_DELTA ({self.lora_name})", logger_obj=logger_lora)
+                logger_lora.debug(f"LoRA {self.lora_name} current_scale_val: {current_scale_val}, multiplier: {self.multiplier}")
+
 
             # LoRA Gradient-Guided Perturbation Optimization
             if self.training and self.ggpo_sigma is not None and self.ggpo_beta is not None and self.combined_weight_norms is not None and self.grad_norms is not None:
+                # ... (GGPO logic - ensure inputs here are also checked if GGPO is active and suspected) ...
+                # This path is not taken in your current command.
                 with torch.no_grad():
                     perturbation_scale = (self.ggpo_sigma * torch.sqrt(self.combined_weight_norms ** 2)) + (self.ggpo_beta * (self.grad_norms ** 2))
                     perturbation_scale_factor = (perturbation_scale * self.perturbation_norm_factor).to(self.device)
                     perturbation = torch.randn(self.org_module_shape,  dtype=self.dtype, device=self.device)
                     perturbation.mul_(perturbation_scale_factor)
-                    perturbation_output = x @ perturbation.T  # Result: (batch × n)
-                return org_forwarded + (self.multiplier * scale * lx) + perturbation_output
+                    perturbation_output = x @ perturbation.T
+                final_output = org_forwarded + lora_delta + perturbation_output
             else:
-                return org_forwarded + lx * self.multiplier * scale
-        else:
-            lxs = [lora_down(x) for lora_down in self.lora_down]
+                final_output = org_forwarded + lora_delta
+            
+            if is_first_double_block_lora:
+                log_tensor_stats(final_output, f"FINAL_OUTPUT ({self.lora_name})", logger_obj=logger_lora)
+                if torch.isnan(final_output).any():
+                     logger_lora.error(f"NAN DETECTED IN LoRA MODULE: {self.lora_name} at FINAL_OUTPUT")
 
-            # normal dropout
+            return final_output
+        else: # split_dims path
+            # Add similar detailed logging here if self.split_dims is ever True
+            lxs_down = [lora_down_i(x) for lora_down_i in self.lora_down] # Renamed loop var
+
+            lxs_processed = lxs_down
             if self.dropout is not None and self.training:
-                lxs = [torch.nn.functional.dropout(lx, p=self.dropout) for lx in lxs]
+                lxs_processed = [torch.nn.functional.dropout(lx_p, p=self.dropout) for lx_p in lxs_processed] # Renamed loop var
 
-            # rank dropout
             if self.rank_dropout is not None and self.training:
-                masks = [torch.rand((lx.size(0), self.lora_dim), device=lx.device) > self.rank_dropout for lx in lxs]
-                for i in range(len(lxs)):
-                    if len(lx.size()) == 3:
-                        masks[i] = masks[i].unsqueeze(1)
-                    elif len(lx.size()) == 4:
-                        masks[i] = masks[i].unsqueeze(-1).unsqueeze(-1)
-                    lxs[i] = lxs[i] * masks[i]
-
-                # scaling for rank dropout: treat as if the rank is changed
-                scale = self.scale * (1.0 / (1.0 - self.rank_dropout))  # redundant for readability
+                # ... (rank dropout logic for split_dims) ...
+                # This part would also need logging if active
+                masks = [torch.rand((lx_p.size(0), self.lora_dim), device=lx_p.device) > self.rank_dropout for lx_p in lxs_processed]
+                for i in range(len(lxs_processed)):
+                    if len(lxs_processed[i].size()) == 3: masks[i] = masks[i].unsqueeze(1)
+                    elif len(lxs_processed[i].size()) == 4: masks[i] = masks[i].unsqueeze(-1).unsqueeze(-1)
+                    lxs_processed[i] = lxs_processed[i] * masks[i]
+                current_scale_val = self.scale * (1.0 / (1.0 - self.rank_dropout))
             else:
-                scale = self.scale
+                current_scale_val = self.scale
 
-            lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
+            lxs_up = [lora_up_i(lx_p) for lora_up_i, lx_p in zip(self.lora_up, lxs_processed)] # Renamed loop vars
 
-            return org_forwarded + torch.cat(lxs, dim=-1) * self.multiplier * scale
+            lora_delta_cat = torch.cat(lxs_up, dim=-1) * self.multiplier * current_scale_val
+            final_output = org_forwarded + lora_delta_cat
+            
+            # Add logging for split_dims path if it's taken and suspected
+            # if "double_blocks_0" in self.lora_name and self.split_dims:
+            #    log_tensor_stats(lora_delta_cat, f"LORA_DELTA_CAT ({self.lora_name})", logger_obj=logger_lora)
+            #    log_tensor_stats(final_output, f"FINAL_OUTPUT_SPLIT ({self.lora_name})", logger_obj=logger_lora)
+            #    if torch.isnan(final_output).any():
+            #         logger_lora.error(f"NAN DETECTED IN LoRA MODULE (split_dims): {self.lora_name} at FINAL_OUTPUT_SPLIT")
+
+            return final_output
 
     @torch.no_grad()
     def initialize_norm_cache(self, org_module_weight: Tensor):
