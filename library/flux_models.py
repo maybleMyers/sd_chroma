@@ -40,14 +40,14 @@ class FluxParams:
     axes_dim: list[int]
     theta: int
     qkv_bias: bool
-    guidance_embed = False
-    use_modulation = False
-    use_distilled_guidance_layer = True
+    guidance_embed: bool = False
+    use_modulation: bool = False
+    use_distilled_guidance_layer: bool = True
     approximator_config: Optional[ApproximatorParams] = None
     vec_in_dim: Optional[int] = None
     distilled_guidance_dim: Optional[int] = None
-    use_time_embed = False
-    use_vector_embed = False
+    use_time_embed: bool = False
+    use_vector_embed: bool = False
     double_block_has_main_norms: Optional[bool] = None
 
 @dataclass
