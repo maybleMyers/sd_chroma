@@ -19,55 +19,6 @@ from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from library import custom_offloading_utils
 
 logger = logging.getLogger(__name__)
-
-@dataclass
-class ApproximatorParams:
-    in_dim: int = 64
-    out_dim_per_mod_vector: int = 3072
-    hidden_dim: int = 5120
-    n_layers: int = 5
-    mod_index_length: int = 344
-
-@dataclass
-class FluxParams:
-    in_channels: int
-    context_in_dim: int
-    hidden_size: int
-    mlp_ratio: float
-    num_heads: int
-    depth: int
-    depth_single_blocks: int
-    axes_dim: list[int]
-    theta: int
-    qkv_bias: bool
-    guidance_embed: bool = False
-    use_modulation: bool = False
-    use_distilled_guidance_layer: bool = True
-    approximator_config: Optional[ApproximatorParams] = None
-    vec_in_dim: Optional[int] = None
-    distilled_guidance_dim: Optional[int] = None
-    use_time_embed: bool = False
-    use_vector_embed: bool = False
-    double_block_has_main_norms: Optional[bool] = None
-
-@dataclass
-class AutoEncoderParams:
-    resolution = 256
-    in_channels = 3
-    ch = 128
-    out_ch = 3
-    ch_mult: list[int] = field(default_factory=lambda: [1, 2, 4, 4])
-    num_res_blocks = 2
-    z_channels = 16
-    scale_factor = 0.3611
-    shift_factor = 0.1159
-
-@dataclass
-class ModulationOut:
-    shift: Tensor
-    scale: Tensor
-    gate: Tensor
-
 def log_tensor_stats(tensor, name = "tensor", logger_obj = None):
     if logger_obj is None:
         logger_obj = logging.getLogger(__name__)
@@ -106,6 +57,66 @@ def apply_rope(xq, xk, freqs_cis):
     xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
     xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
     return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+def get_chroma_model_params():
+    app_config = ApproximatorParams(
+        in_dim=64,
+        out_dim_per_mod_vector=3072,
+        hidden_dim=5120,
+        n_layers=5,
+        mod_index_length=344
+    )
+    return FluxParams(
+        in_channels=64, context_in_dim=4096, hidden_size=3072,
+        mlp_ratio=4.0, num_heads=24, depth=19, depth_single_blocks=38,
+        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True,
+        guidance_embed=False,
+        use_modulation=False,
+        use_distilled_guidance_layer=True,
+        approximator_config=app_config,
+        use_time_embed=False,
+        use_vector_embed=False,
+        double_block_has_main_norms=False
+    )
+
+def flux1_dev_params(depth_double=19, depth_single=38):
+    return FluxParams(in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072,
+        mlp_ratio=4.0, num_heads=24, depth=depth_double, depth_single_blocks=depth_single,
+        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True,
+        guidance_embed=True, use_modulation=True,
+        use_distilled_guidance_layer=False,
+        approximator_config=None,
+        use_time_embed=True, use_vector_embed=True,
+        double_block_has_main_norms=True)
+
+def flux1_schnell_params(depth_double=19, depth_single=38):
+    return FluxParams(in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072,
+        mlp_ratio=4.0, num_heads=24, depth=depth_double, depth_single_blocks=depth_single,
+        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True,
+        guidance_embed=False, use_modulation=True,
+        use_distilled_guidance_layer=False,
+        approximator_config=None,
+        use_time_embed=True, use_vector_embed=True,
+        double_block_has_main_norms=True)
+
+def flux_chroma_params():
+    params = FluxParams(
+        in_channels=64, context_in_dim=4096, hidden_size=3072,
+        mlp_ratio=4.0, num_heads=24, depth=19, depth_single_blocks=38,
+        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True,
+        guidance_embed=False,
+        use_modulation=False,
+        use_distilled_guidance_layer=True,
+        use_time_embed=False,
+        use_vector_embed=False,
+        approximator_config=ApproximatorParams(
+            in_dim=64,
+            out_dim_per_mod_vector=3072,
+            hidden_dim=5120,
+            n_layers=5,
+            mod_index_length=344
+        )
+    )
+    return params
 
 def rope(pos, dim, theta):
     assert dim % 2 == 0
@@ -158,6 +169,55 @@ def zero_module(module):
     for p in module.parameters():
         nn.init.zeros_(p)
     return module
+
+@dataclass
+class ApproximatorParams:
+    in_dim: int = 64
+    out_dim_per_mod_vector: int = 3072
+    hidden_dim: int = 5120
+    n_layers: int = 5
+    mod_index_length: int = 344
+
+@dataclass
+class FluxParams:
+    in_channels: int
+    context_in_dim: int
+    hidden_size: int
+    mlp_ratio: float
+    num_heads: int
+    depth: int
+    depth_single_blocks: int
+    axes_dim: list[int]
+    theta: int
+    qkv_bias: bool
+    guidance_embed: bool = False
+    use_modulation: bool = False
+    use_distilled_guidance_layer: bool = True
+    approximator_config: Optional[ApproximatorParams] = None
+    vec_in_dim: Optional[int] = None
+    distilled_guidance_dim: Optional[int] = None
+    use_time_embed: bool = False
+    use_vector_embed: bool = False
+    double_block_has_main_norms: Optional[bool] = None
+
+@dataclass
+class AutoEncoderParams:
+    resolution = 256
+    in_channels = 3
+    ch = 128
+    out_ch = 3
+    ch_mult: list[int] = field(default_factory=lambda: [1, 2, 4, 4])
+    num_res_blocks = 2
+    z_channels = 16
+    scale_factor = 0.3611
+    shift_factor = 0.1159
+
+@dataclass
+class ModulationOut:
+    shift: Tensor
+    scale: Tensor
+    gate: Tensor
+
 
 class MLPEmbedder(nn.Module):
     def __init__(self, in_dim, hidden_dim):
@@ -942,66 +1002,6 @@ class ControlNetFlux(nn.Module):
         
         return double_block_outputs, single_block_outputs
 
-def get_chroma_model_params():
-    app_config = ApproximatorParams(
-        in_dim=64,
-        out_dim_per_mod_vector=3072,
-        hidden_dim=5120,
-        n_layers=5,
-        mod_index_length=344
-    )
-    return FluxParams(
-        in_channels=64, context_in_dim=4096, hidden_size=3072,
-        mlp_ratio=4.0, num_heads=24, depth=19, depth_single_blocks=38,
-        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True,
-        guidance_embed=False,
-        use_modulation=False,
-        use_distilled_guidance_layer=True,
-        approximator_config=app_config,
-        use_time_embed=False,
-        use_vector_embed=False,
-        double_block_has_main_norms=False
-    )
-
-def flux1_dev_params(depth_double=19, depth_single=38):
-    return FluxParams(in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072,
-        mlp_ratio=4.0, num_heads=24, depth=depth_double, depth_single_blocks=depth_single,
-        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True,
-        guidance_embed=True, use_modulation=True,
-        use_distilled_guidance_layer=False,
-        approximator_config=None,
-        use_time_embed=True, use_vector_embed=True,
-        double_block_has_main_norms=True)
-
-def flux1_schnell_params(depth_double=19, depth_single=38):
-    return FluxParams(in_channels=64, vec_in_dim=768, context_in_dim=4096, hidden_size=3072,
-        mlp_ratio=4.0, num_heads=24, depth=depth_double, depth_single_blocks=depth_single,
-        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True,
-        guidance_embed=False, use_modulation=True,
-        use_distilled_guidance_layer=False,
-        approximator_config=None,
-        use_time_embed=True, use_vector_embed=True,
-        double_block_has_main_norms=True)
-
-def flux_chroma_params():
-    params = FluxParams(
-        in_channels=64, context_in_dim=4096, hidden_size=3072,
-        mlp_ratio=4.0, num_heads=24, depth=19, depth_single_blocks=38,
-        axes_dim=[16, 56, 56], theta=10_000, qkv_bias=True,
-        guidance_embed=False,
-        use_modulation=False,
-        use_distilled_guidance_layer=True,
-        use_time_embed=False,
-        use_vector_embed=False,
-        approximator_config=ApproximatorParams(
-            in_dim=64,
-            out_dim_per_mod_vector=3072,
-            hidden_dim=5120,
-            n_layers=5,
-            mod_index_length=344
-        )
-    )
-    return params
 
 model_configs = {
     "dev": {"params_fn": flux1_dev_params},
