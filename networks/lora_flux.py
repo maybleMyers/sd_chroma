@@ -125,8 +125,7 @@ class LoRAModule(torch.nn.Module):
 
     def forward(self, x):
         org_forwarded = self.org_forward(x)
-        logger.debug(f"LoRA {self.lora_name}: Bypassing LoRA application for debugging.")
-        return org_forwarded 
+        
         # module dropout
         if self.module_dropout is not None and self.training:
             if torch.rand(1) < self.module_dropout:
