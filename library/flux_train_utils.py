@@ -141,7 +141,14 @@ def _scipy_assignment(C):
 def cosine_optimal_transport(X, Y, backend="auto"):
     X_norm = X / torch.norm(X, dim=1, keepdim=True).clamp(min=1e-6)
     Y_norm = Y / torch.norm(Y, dim=1, keepdim=True).clamp(min=1e-6)
+    if torch.isnan(X_norm).any() or torch.isinf(X_norm).any():
+        logger.error("SOT: NaN/Inf in X_norm!")
+        # Consider dumping X here if this happens
+    if torch.isnan(Y_norm).any() or torch.isinf(Y_norm).any():
+        logger.error("SOT: NaN/Inf in Y_norm!")
     C = -torch.mm(X_norm, Y_norm.t())
+    if torch.isnan(C).any() or torch.isinf(C).any():
+        logger.error(f"SOT: NaN/Inf in Cost Matrix C! C min: {C.min()}, C max: {C.max()}")
 
     if backend == "scipy": return _scipy_assignment(C)
     elif backend == "cuda": return _cuda_assignment(C)
@@ -150,8 +157,11 @@ def cosine_optimal_transport(X, Y, backend="auto"):
         except (ImportError, RuntimeError): return _scipy_assignment(C)
 
 def prepare_sot_pairings(latents_bhwc: torch.Tensor, device: torch.device):
-    latents_bhwc = latents_bhwc.to(device=device, dtype=torch.float32)
+    logger.debug(f"SOT PREP: Input latents_bhwc shape: {latents_bhwc.shape}, dtype: {latents_bhwc.dtype}, NaN: {torch.isnan(latents_bhwc).any()}")
+    latents_bhwc = latents_bhwc.to(device=device, dtype=torch.float32) # Ensure float32 for SOT math
     latents_flat, latent_shape_tuple = vae_flatten(latents_bhwc)
+    logger.debug(f"SOT PREP: latents_flat shape: {latents_flat.shape}, NaN: {torch.isnan(latents_flat).any()}")
+
     n_batch, num_tokens, channels_flat = latents_flat.shape
     _, _, h_orig, w_orig = latent_shape_tuple
     image_pos_id_b_tokens_3 = prepare_latent_image_ids(n_batch, h_orig, w_orig).to(device)
@@ -159,28 +169,34 @@ def prepare_sot_pairings(latents_bhwc: torch.Tensor, device: torch.device):
     num_points_dist = 1000
     x_dist, probabilities_dist = create_distribution(num_points_dist, device=device)
     input_timestep_b = sample_from_distribution(x_dist, probabilities_dist, n_batch, device=device)
+    logger.debug(f"SOT PREP: input_timestep_b min: {input_timestep_b.min()}, max: {input_timestep_b.max()}, NaN: {torch.isnan(input_timestep_b).any()}")
     timesteps_b_1_1 = input_timestep_b[:, None, None]
 
     noise_b_tokens_c = torch.randn_like(latents_flat)
+    logger.debug(f"SOT PREP: initial noise_b_tokens_c NaN: {torch.isnan(noise_b_tokens_c).any()}")
     
-    # Reshape for OT: each image's flattened representation is a sample
-    # X and Y should be (n_batch, num_tokens * channels_flat)
-    _, indices = cosine_optimal_transport(
-        latents_flat.reshape(n_batch, -1), noise_b_tokens_c.reshape(n_batch, -1)
-    )
-    # indices[1] refers to the optimal column indices from Y (noise) for each row in X (latents)
-    # It will be shape (1, n_batch). We need (n_batch,) for indexing.
+    reshaped_latents_flat = latents_flat.reshape(n_batch, -1)
+    reshaped_noise = noise_b_tokens_c.reshape(n_batch, -1)
+    logger.debug(f"SOT PREP: reshaped_latents_flat for OT NaN: {torch.isnan(reshaped_latents_flat).any()}")
+    logger.debug(f"SOT PREP: reshaped_noise for OT NaN: {torch.isnan(reshaped_noise).any()}")
+
+    _, indices = cosine_optimal_transport(reshaped_latents_flat, reshaped_noise)
+    
     noise_indices_for_pairing = indices[1].view(-1)
     noise_b_tokens_c_ot_paired = noise_b_tokens_c[noise_indices_for_pairing]
+    logger.debug(f"SOT PREP: noise_b_tokens_c_ot_paired NaN: {torch.isnan(noise_b_tokens_c_ot_paired).any()}")
 
     noisy_latents_b_tokens_c = latents_flat * (1 - timesteps_b_1_1) + noise_b_tokens_c_ot_paired * timesteps_b_1_1
+    logger.debug(f"SOT PREP: noisy_latents_b_tokens_c NaN: {torch.isnan(noisy_latents_b_tokens_c).any()}, Inf: {torch.isinf(noisy_latents_b_tokens_c).any()}")
+    
     target_b_tokens_c = noise_b_tokens_c_ot_paired - latents_flat
+    logger.debug(f"SOT PREP: target_b_tokens_c NaN: {torch.isnan(target_b_tokens_c).any()}, Inf: {torch.isinf(target_b_tokens_c).any()}")
 
     return (
         noisy_latents_b_tokens_c.to(torch.bfloat16),
         target_b_tokens_c.to(torch.bfloat16),
         input_timestep_b.to(torch.bfloat16),
-        image_pos_id_b_tokens_3, # Keep as long/float as appropriate for embeddings
+        image_pos_id_b_tokens_3,
         latent_shape_tuple,
     )
 
@@ -191,25 +207,39 @@ def calculate_chroma_loss_step(
     total_batch_size_for_loss_norm: int,
     current_minibatch_size: int
 ):
-    loss_per_sample = ((model_prediction.float() - target_for_minibatch.float()) ** 2).mean(dim=(1, 2))
+    logger.debug(f"SOT LOSS: model_prediction shape: {model_prediction.shape}, NaN: {torch.isnan(model_prediction).any()}, Inf: {torch.isinf(model_prediction).any()}")
+    logger.debug(f"SOT LOSS: target_for_minibatch shape: {target_for_minibatch.shape}, NaN: {torch.isnan(target_for_minibatch).any()}, Inf: {torch.isinf(target_for_minibatch).any()}")
+    logger.debug(f"SOT LOSS: loss_weighting_for_minibatch: {loss_weighting_for_minibatch}, NaN: {torch.isnan(loss_weighting_for_minibatch).any()}")
+
+    # Ensure inputs are float32 for stable loss calculation, then cast back if needed.
+    # model_prediction and target_for_minibatch are already cast to bfloat16 in prepare_sot_pairings return
+    # So, they might need to be .float() here for the squared error.
+    loss_per_sample = ((model_prediction.float() - target_for_minibatch.float()) ** 2)
+    logger.debug(f"SOT LOSS: loss_per_sample (before mean) NaN: {torch.isnan(loss_per_sample).any()}, Inf: {torch.isinf(loss_per_sample).any()}")
+    loss_per_sample = loss_per_sample.mean(dim=(1, 2))
+    logger.debug(f"SOT LOSS: loss_per_sample (after mean): {loss_per_sample}, NaN: {torch.isnan(loss_per_sample).any()}")
     
-    if total_batch_size_for_loss_norm == 0: num_minibatches_in_total_batch = 1.0 # Avoid div by zero
+    if total_batch_size_for_loss_norm == 0: num_minibatches_in_total_batch = 1.0
     else: num_minibatches_in_total_batch = total_batch_size_for_loss_norm / current_minibatch_size
-    if num_minibatches_in_total_batch == 0 : num_minibatches_in_total_batch = 1.0 # Should not happen if current_minibatch_size > 0
+    if num_minibatches_in_total_batch == 0 : num_minibatches_in_total_batch = 1.0
 
     loss_per_sample_normalized = loss_per_sample / num_minibatches_in_total_batch
+    logger.debug(f"SOT LOSS: loss_per_sample_normalized: {loss_per_sample_normalized}, NaN: {torch.isnan(loss_per_sample_normalized).any()}")
+
     weights = loss_weighting_for_minibatch.to(device=loss_per_sample_normalized.device, dtype=loss_per_sample_normalized.dtype)
     weights_sum = weights.sum()
+    logger.debug(f"SOT LOSS: weights_sum: {weights_sum}")
 
-    if weights_sum > 1e-6: normalized_minibatch_weights = weights / weights_sum
-    else: normalized_minibatch_weights = torch.ones_like(weights) / (weights.numel() if weights.numel() > 0 else 1.0)
+    if weights_sum.abs() > 1e-6: # check absolute value for sum being too small
+        normalized_minibatch_weights = weights / weights_sum
+    else:
+        logger.warning("SOT LOSS: loss_weighting_for_minibatch sum is close to zero. Using uniform weights for this minibatch.")
+        normalized_minibatch_weights = torch.ones_like(weights) / (weights.numel() if weights.numel() > 0 else 1.0)
+    logger.debug(f"SOT LOSS: normalized_minibatch_weights: {normalized_minibatch_weights}, NaN: {torch.isnan(normalized_minibatch_weights).any()}")
     
     final_loss = (loss_per_sample_normalized * normalized_minibatch_weights).sum()
+    logger.debug(f"SOT LOSS: final_loss: {final_loss.item()}, NaN: {torch.isnan(final_loss).any()}")
     return final_loss
-
-# endregion
-
-
 # region sample images (existing code)
 def sample_images(
     accelerator: Accelerator,

@@ -32,6 +32,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+torch.autograd.set_detect_anomaly(True)
 
 class FluxNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
@@ -452,6 +453,11 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         weighting = None # Default, Chroma SOT loss does its own weighting
 
         if self._is_chroma_sot_loss_active(args):
+            logger.debug(f"SOT Path: Input latents shape {latents.shape}, dtype {latents.dtype}, NaN: {torch.isnan(latents).any()}")
+            noisy_model_input_sot, target_sot, timesteps_sot, img_ids_sot, original_latent_shape = \
+                flux_train_utils.prepare_sot_pairings(latents, accelerator.device)
+            logger.debug(f"SOT Path: noisy_model_input_sot shape {noisy_model_input_sot.shape}, dtype {noisy_model_input_sot.dtype}, NaN: {torch.isnan(noisy_model_input_sot).any()}")
+            logger.debug(f"SOT Path: target_sot shape {target_sot.shape}, dtype {target_sot.dtype}, NaN: {torch.isnan(target_sot).any()}")
             # Chroma SOT loss logic
             # latents are (B, C, H, W)
             # prepare_sot_pairings returns:
@@ -536,11 +542,17 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 )
                 logger.debug("unet.forward() returned.")
             return model_pred_out
-
+        logger.debug(f"UNET CALL: packed_noisy_model_input shape {packed_noisy_model_input.shape}, dtype {packed_noisy_model_input.dtype}, NaN: {torch.isnan(packed_noisy_model_input).any()}")
+        logger.debug(f"UNET CALL: img_ids shape {img_ids.shape}, dtype {img_ids.dtype}") # img_ids shouldn't be NaN if long
+        logger.debug(f"UNET CALL: t5_out shape {t5_out.shape if t5_out is not None else 'None'}, NaN: {torch.isnan(t5_out).any() if t5_out is not None else 'N/A'}")
+        logger.debug(f"UNET CALL: txt_ids_for_unet shape {txt_ids_for_unet.shape if txt_ids_for_unet is not None else 'None'}")
+        logger.debug(f"UNET CALL: l_pooled shape {l_pooled.shape if l_pooled is not None else 'None'}, NaN: {torch.isnan(l_pooled).any() if l_pooled is not None else 'N/A'}")
+        logger.debug(f"UNET CALL: timesteps mean {timesteps.mean().item() if timesteps is not None and timesteps.numel() > 0 else 'None'}, NaN: {torch.isnan(timesteps).any() if timesteps is not None else 'N/A'}")
         model_pred = call_dit_func(
             packed_noisy_model_input, img_ids, t5_out, txt_ids_for_unet,
             l_pooled, timesteps, guidance_vec, actual_t5_attn_mask_for_model,
         )
+        logger.debug(f"UNET CALL: model_pred output shape {model_pred.shape}, dtype {model_pred.dtype}, NaN: {torch.isnan(model_pred).any()}, Inf: {torch.isinf(model_pred).any()}")
 
         if not self._is_chroma_sot_loss_active(args): # Original FLUX/SD3 path
             # model_pred is (B, L_flat_packed, C_out_packed)
