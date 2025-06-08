@@ -41,7 +41,10 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.is_swapping_blocks: bool = False
         self.train_clip_l: bool = False  # Initialize here
         self.train_t5xxl: bool = False # Initialize here
-
+    def all_reduce_network(self, accelerator, network):
+        for param in network.parameters():
+            if param.grad is not None:
+                param.grad = accelerator.reduce(param.grad, reduction="mean")
     def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype, is_train=True):
         """
         Called at the start of each training step. Implements basic logging and ensures compatibility
