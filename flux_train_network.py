@@ -552,6 +552,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             packed_noisy_model_input, img_ids, t5_out, txt_ids_for_unet,
             l_pooled, timesteps, guidance_vec, actual_t5_attn_mask_for_model,
         )
+        logger.debug(f"UNET OUTPUT: model_pred shape {model_pred.shape}, dtype {model_pred.dtype}, NaN: {torch.isnan(model_pred).any()}, Inf: {torch.isinf(model_pred).any()}")
         logger.debug(f"UNET CALL: model_pred output shape {model_pred.shape}, dtype {model_pred.dtype}, NaN: {torch.isnan(model_pred).any()}, Inf: {torch.isinf(model_pred).any()}")
 
         if not self._is_chroma_sot_loss_active(args): # Original FLUX/SD3 path

@@ -463,6 +463,8 @@ class NetworkTrainer:
             text_encoder_conds_to_use, # Use the determined conds
             unet, network, weight_dtype, train_unet, is_train=is_train,
         )
+        logger.debug(f"PROCESS_BATCH INPUT TO LOSS: noise_pred shape {noise_pred.shape}, dtype {noise_pred.dtype}, NaN: {torch.isnan(noise_pred).any()}, Inf: {torch.isinf(noise_pred).any()}")
+        logger.debug(f"PROCESS_BATCH INPUT TO LOSS: target shape {target.shape}, dtype {target.dtype}, NaN: {torch.isnan(target).any()}, Inf: {torch.isinf(target).any()}")
 
         # Chroma SOT Loss Path
         if self._is_chroma_sot_loss_active(args):

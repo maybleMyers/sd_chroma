@@ -121,13 +121,23 @@ def sample_from_distribution(x, probabilities, num_samples, device=None):
 def _cuda_assignment(C):
     try:
         from torch_linear_assignment import batch_linear_assignment, assignment_to_indices
-        assignment = batch_linear_assignment(C.unsqueeze(dim=0))
+        # logger.debug("torch_linear_assignment imported in _cuda_assignment.")
+    except ImportError as e:
+        logger.error(f"Failed to import from torch_linear_assignment in _cuda_assignment: {e}")
+        raise # Re-raise to be caught by cosine_optimal_transport
+    
+    if not C.is_cuda:
+        logger.warning("Cost matrix C is not on CUDA, cannot use CUDA assignment. This should not happen if device is cuda.")
+        raise RuntimeError("Cost matrix not on CUDA for CUDA assignment.")
+
+    try:
+        assignment = batch_linear_assignment(C.unsqueeze(dim=0).contiguous()) # ensure contiguous
         row_indices, col_indices = assignment_to_indices(assignment)
         matching_pairs = (row_indices, col_indices)
         return C, matching_pairs
-    except ImportError as e:
-        logger.warning("torch_linear_assignment not found. Install it for CUDA OT. Falling back to SciPy if CUDA fails.")
-        raise e # Re-raise to trigger fallback in cosine_optimal_transport
+    except Exception as e:
+        logger.error(f"Runtime error during batch_linear_assignment or assignment_to_indices: {e}")
+        raise # Re-raise to be caught
 
 def _scipy_assignment(C):
     C_np = C.to(torch.float32).detach().cpu().numpy() # Ensure float32 for SciPy
@@ -151,16 +161,25 @@ def cosine_optimal_transport(X, Y, backend="auto"):
         logger.error(f"SOT: NaN/Inf in Cost Matrix C! C min: {C.min()}, C max: {C.max()}")
 
     if backend == "scipy": return _scipy_assignment(C)
-    elif backend == "cuda": return _cuda_assignment(C)
+    elif backend == "cuda":
+        try:
+            return _cuda_assignment(C) # Try CUDA
+        except (ImportError, RuntimeError, AttributeError) as e: # Added AttributeError
+            logger.error(f"CUDA OT explicitly requested but failed: {type(e).__name__}: {e}. Falling back to SciPy.")
+            return _scipy_assignment(C)
     else: # auto
-        try: return _cuda_assignment(C)
-        except (ImportError, RuntimeError): return _scipy_assignment(C)
+        try:
+            # logger.debug("Attempting CUDA backend for Optimal Transport.") # Optional: uncomment for very verbose
+            return _cuda_assignment(C)
+        except (ImportError, RuntimeError, AttributeError) as e: # Added AttributeError
+            logger.warning(f"CUDA OT failed (backend={backend}), falling back to SciPy. Error: {type(e).__name__}: {e}")
+            return _scipy_assignment(C)
 
 def prepare_sot_pairings(latents_bhwc: torch.Tensor, device: torch.device):
-    logger.debug(f"SOT PREP: Input latents_bhwc shape: {latents_bhwc.shape}, dtype: {latents_bhwc.dtype}, NaN: {torch.isnan(latents_bhwc).any()}")
-    latents_bhwc = latents_bhwc.to(device=device, dtype=torch.float32) # Ensure float32 for SOT math
+    logger.debug(f"SOT PREP: Input latents_bhwc shape: {latents_bhwc.shape}, dtype: {latents_bhwc.dtype}, NaN: {torch.isnan(latents_bhwc).any()}, Inf: {torch.isinf(latents_bhwc).any()}")
+    latents_bhwc = latents_bhwc.to(device=device, dtype=torch.float32)
     latents_flat, latent_shape_tuple = vae_flatten(latents_bhwc)
-    logger.debug(f"SOT PREP: latents_flat shape: {latents_flat.shape}, NaN: {torch.isnan(latents_flat).any()}")
+    logger.debug(f"SOT PREP: latents_flat shape: {latents_flat.shape}, dtype: {latents_flat.dtype}, NaN: {torch.isnan(latents_flat).any()}, Inf: {torch.isinf(latents_flat).any()}")
 
     n_batch, num_tokens, channels_flat = latents_flat.shape
     _, _, h_orig, w_orig = latent_shape_tuple
@@ -187,11 +206,9 @@ def prepare_sot_pairings(latents_bhwc: torch.Tensor, device: torch.device):
     logger.debug(f"SOT PREP: noise_b_tokens_c_ot_paired NaN: {torch.isnan(noise_b_tokens_c_ot_paired).any()}")
 
     noisy_latents_b_tokens_c = latents_flat * (1 - timesteps_b_1_1) + noise_b_tokens_c_ot_paired * timesteps_b_1_1
-    logger.debug(f"SOT PREP: noisy_latents_b_tokens_c NaN: {torch.isnan(noisy_latents_b_tokens_c).any()}, Inf: {torch.isinf(noisy_latents_b_tokens_c).any()}")
-    
+    logger.debug(f"SOT PREP: noisy_latents_b_tokens_c shape: {noisy_latents_b_tokens_c.shape}, dtype: {noisy_latents_b_tokens_c.dtype}, NaN: {torch.isnan(noisy_latents_b_tokens_c).any()}, Inf: {torch.isinf(noisy_latents_b_tokens_c).any()}")    
     target_b_tokens_c = noise_b_tokens_c_ot_paired - latents_flat
-    logger.debug(f"SOT PREP: target_b_tokens_c NaN: {torch.isnan(target_b_tokens_c).any()}, Inf: {torch.isinf(target_b_tokens_c).any()}")
-
+    logger.debug(f"SOT PREP: target_b_tokens_c shape: {target_b_tokens_c.shape}, dtype: {target_b_tokens_c.dtype}, NaN: {torch.isnan(target_b_tokens_c).any()}, Inf: {torch.isinf(target_b_tokens_c).any()}")
     return (
         noisy_latents_b_tokens_c.to(torch.bfloat16),
         target_b_tokens_c.to(torch.bfloat16),
@@ -207,8 +224,8 @@ def calculate_chroma_loss_step(
     total_batch_size_for_loss_norm: int,
     current_minibatch_size: int
 ):
-    logger.debug(f"SOT LOSS: model_prediction shape: {model_prediction.shape}, NaN: {torch.isnan(model_prediction).any()}, Inf: {torch.isinf(model_prediction).any()}")
-    logger.debug(f"SOT LOSS: target_for_minibatch shape: {target_for_minibatch.shape}, NaN: {torch.isnan(target_for_minibatch).any()}, Inf: {torch.isinf(target_for_minibatch).any()}")
+    logger.debug(f"SOT LOSS: model_prediction shape: {model_prediction.shape}, dtype: {model_prediction.dtype}, NaN: {torch.isnan(model_prediction).any()}, Inf: {torch.isinf(model_prediction).any()}")
+    logger.debug(f"SOT LOSS: target_for_minibatch shape: {target_for_minibatch.shape}, dtype: {target_for_minibatch.dtype}, NaN: {torch.isnan(target_for_minibatch).any()}, Inf: {torch.isinf(target_for_minibatch.any())}")
     logger.debug(f"SOT LOSS: loss_weighting_for_minibatch: {loss_weighting_for_minibatch}, NaN: {torch.isnan(loss_weighting_for_minibatch).any()}")
 
     # Ensure inputs are float32 for stable loss calculation, then cast back if needed.
