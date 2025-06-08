@@ -1096,3 +1096,206 @@ class AutoEncoder(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor: 
         return self.decode(self.encode(x))
+    
+    # Add this class definition within your flux_models.py
+
+def zero_module(module): # Helper for ControlNet
+    for p in module.parameters():
+        nn.init.zeros_(p)
+    return module
+
+class ControlNetFlux(nn.Module):
+    # This definition is based on a common ControlNet adaptation for DiT/Flux-like models.
+    # It mirrors the main Flux/ChromaModel structure but includes an input_hint_block
+    # and outputs intermediate features.
+    def __init__(self, params: FluxParams, controlnet_depth_mult: float = 1.0): # Takes FluxParams
+        super().__init__()
+        self.params_dto = params # Use the same FluxParams as the main model
+        self.in_channels = params.in_channels
+        
+        if params.hidden_size % params.num_heads != 0: 
+            raise ValueError(f"Hidden {params.hidden_size} not div by {params.num_heads}")
+        pe_dim = params.hidden_size // params.num_heads
+        if sum(params.axes_dim) != pe_dim: 
+            raise ValueError(f"axes_dim sum {sum(params.axes_dim)} != pe_dim {pe_dim}")
+        
+        self.hidden_size = params.hidden_size
+        self.num_heads = params.num_heads
+
+        self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
+        self.img_in = nn.Linear(self.in_channels, self.hidden_size, bias=True)
+        self.txt_in = nn.Linear(params.context_in_dim, self.hidden_size, bias=True)
+
+        # ControlNet specific input hint processing
+        self.input_hint_block = nn.Sequential(
+            nn.Conv2d(3, 16, 3, padding=1), nn.SiLU(),
+            nn.Conv2d(16, 16, 3, padding=1), nn.SiLU(),
+            nn.Conv2d(16, 32, 3, padding=1, stride=2), nn.SiLU(), # 32 out
+            nn.Conv2d(32, 32, 3, padding=1), nn.SiLU(),
+            nn.Conv2d(32, 96, 3, padding=1, stride=2), nn.SiLU(), # 96 out
+            nn.Conv2d(96, 96, 3, padding=1), nn.SiLU(),
+            nn.Conv2d(96, 256, 3, padding=1, stride=2), nn.SiLU(), # 256 out
+            zero_module(nn.Conv2d(256, self.in_channels, 3, padding=1)) # Project to self.in_channels (e.g. 64)
+        )
+        # This hint embedder projects the output of input_hint_block to hidden_size
+        # The official ControlNet for SD often has a separate conv layer for this.
+        # Here, we'll add it to the img_in projection.
+        # The above input_hint_block outputs (B, self.in_channels, H_latent_packed, W_latent_packed)
+        # which then needs to be flattened and projected.
+        # self.hint_embedder = nn.Linear(self.in_channels, self.hidden_size, bias=True) # Not strictly needed if added to img_p
+
+        # Conditional components (mirroring ChromaModel's setup for consistency if called)
+        self.time_in = None
+        self.vector_in = None
+        self.guidance_in = nn.Identity()
+        self.distilled_guidance_layer = None # Main modulator for ControlNet if it follows Chroma structure
+        self.modulation_approximator = None # Old name
+
+        if not params.use_modulation and params.approximator_config and params.use_distilled_guidance_layer:
+            app_cfg = params.approximator_config
+            out_dim_for_approx = app_cfg.out_dim_per_mod_vector if app_cfg.out_dim_per_mod_vector != 0 else params.hidden_size
+            self.distilled_guidance_layer = Approximator(
+                app_cfg.in_dim, out_dim_for_approx, app_cfg.hidden_dim, app_cfg.n_layers
+            )
+            self.register_buffer('mod_index', torch.arange(app_cfg.mod_index_length), persistent=False) # Should have unique name or share
+            self.mod_index_length = app_cfg.mod_index_length
+
+        # ControlNet often copies blocks from the UNet but makes them trainable
+        # and adds zero-convolutions for outputs.
+        # For simplicity in this stub, let's assume a similar depth or a fraction.
+        # The actual depth might be different for a pre-trained ControlNet.
+        # Using controlnet_depth_mult to scale the number of blocks.
+        cn_depth = int(params.depth * controlnet_depth_mult)
+        cn_single_depth = int(params.depth_single_blocks * controlnet_depth_mult)
+
+        self.controlnet_double_blocks = nn.ModuleList(
+            [DoubleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio, 
+                               qkv_bias=params.qkv_bias, use_modulation=params.use_modulation, 
+                               has_main_norms=False) # Chroma blocks are non-affine
+             for _ in range(cn_depth)]
+        )
+        self.controlnet_single_blocks = nn.ModuleList(
+            [SingleStreamBlock(self.hidden_size, self.num_heads, mlp_ratio=params.mlp_ratio, use_modulation=params.use_modulation)
+             for _ in range(cn_single_depth)]
+        )
+        
+        # Zero-convolution layers to output control signals
+        self.zero_convs_double = nn.ModuleList([zero_module(nn.Linear(self.hidden_size, self.hidden_size)) for _ in range(cn_depth)])
+        self.zero_convs_single = nn.ModuleList([zero_module(nn.Linear(self.hidden_size, self.hidden_size)) for _ in range(cn_single_depth)])
+
+        # For compatibility with trainer
+        self.num_double_blocks = len(self.controlnet_double_blocks)
+        self.num_single_blocks = len(self.controlnet_single_blocks)
+        self.gradient_checkpointing = False
+        self.cpu_offload_checkpointing = False
+        self.blocks_to_swap = None
+        self.offloader_double = None
+        self.offloader_single = None
+
+
+    @property
+    def device(self): return next(self.parameters()).device
+    @property
+    def dtype(self): return next(self.parameters()).dtype
+
+    def forward(self, 
+                img: Tensor, # Noisy latents from UNet
+                img_ids: Tensor, 
+                controlnet_cond: Tensor, # Hint image (e.g., Canny edges, depth map) (B, 3, H_img, W_img)
+                txt: Tensor, 
+                txt_ids_original_t5: Tensor, 
+                timesteps: Tensor, 
+                y: Optional[Tensor], # clip_pooled
+                guidance: Optional[Tensor] = None, 
+                txt_attention_mask: Optional[Tensor] = None,
+                 attn_padding: int = 1
+                ) -> Tuple[List[Tensor], List[Tensor]]: # Returns list of double block outputs and single block outputs
+
+        # 1. Process ControlNet Hint
+        # controlnet_cond is (B, 3, H_image, W_image)
+        # input_hint_block expects (B, 3, H, W) and outputs (B, self.in_channels, H_latent_packed, W_latent_packed)
+        # Example: If original image is 1024x1024, hint_block outputs (B, 64, 1024/8, 1024/8)
+        # Then this needs to be flattened (packed) like the VAE latents.
+        hint = self.input_hint_block(controlnet_cond) # (B, C_packed_vae, H_packed_vae, W_packed_vae)
+        # This hint should be (B, L_img_packed, D_packed_vae_channels*4) or (B, L_img_packed, self.in_channels)
+        # after packing to match `img` input.
+        # The output of input_hint_block is already in_channels.
+        hint_packed = rearrange(hint, "b c h w -> b (h w) c") # (B, L_packed, C_packed_vae=self.in_channels)
+        
+        # Initial projection for hint, similar to img_in for main UNet features
+        hint_p = self.img_in(hint_packed) # Using img_in for consistent projection dimension
+
+        # Combine hint with noisy latents `img` (which are also projected by self.img_in)
+        # The standard ControlNet adds the hint features to the UNet features.
+        img_p = self.img_in(img) + hint_p # Add hint after initial projection
+        
+        txt_f = self.txt_in(txt)
+        
+        _bs = img.shape[0]
+        internal_cond_vec = torch.zeros(_bs, self.hidden_size, device=img.device, dtype=img.dtype) # Chroma has no other conds
+
+        mod_vectors_dict = {}
+        if not self.params_dto.use_modulation and hasattr(self, 'distilled_guidance_layer') and self.distilled_guidance_layer is not None:
+            app_cfg = self.params_dto.approximator_config
+            if app_cfg:
+                ts_emb_approx = timestep_embedding(timesteps.reshape(-1), 16)
+                guid_val_approx = guidance if guidance is not None else torch.zeros_like(timesteps.reshape(-1))
+                guid_emb_approx = timestep_embedding(guid_val_approx.reshape(-1), 16)
+                mod_idx_device = self.mod_index.to(device=img.device, non_blocking=True)
+                mod_idx_batched = mod_idx_device.unsqueeze(0).repeat(_bs, 1)
+                mod_idx_emb = timestep_embedding(mod_idx_batched, 32)
+                ts_guid_combined_emb_approx = torch.cat([ts_emb_approx, guid_emb_approx], dim=-1)
+                ts_guid_emb_approx_repeated = ts_guid_combined_emb_approx.unsqueeze(1).repeat(1, self.mod_index_length, 1)
+                approx_in = torch.cat([ts_guid_emb_approx_repeated, mod_idx_emb], dim=-1)
+                mod_vecs = self.distilled_guidance_layer(approx_in)
+                mod_vectors_dict = distribute_modulations(
+                    mod_vecs, len(self.controlnet_double_blocks), len(self.controlnet_single_blocks), 
+                    final_layer_mod=False # ControlNet doesn't have a "final_layer" like the UNet
+                )
+
+        B, L_txt_calc, _ = txt_f.shape
+        txt_seq_positions = torch.arange(L_txt_calc, device=txt_f.device, dtype=img_ids.dtype).unsqueeze(0).expand(B, -1)
+        txt_pos_ids_3d = torch.zeros(B, L_txt_calc, 3, device=txt_f.device, dtype=img_ids.dtype); txt_pos_ids_3d[..., 0] = txt_seq_positions
+        all_pos_ids = torch.cat((txt_pos_ids_3d, img_ids), dim=1)
+        pe = self.pe_embedder(all_pos_ids)
+        
+        current_img_features = img_p
+        current_txt_features = txt_f
+
+        L_img_calc = current_img_features.shape[1]; L_combined = L_txt_calc + L_img_calc
+        combined_mask_for_attn = None
+        if txt_attention_mask is not None:
+            aligned_txt_mask = txt_attention_mask
+            if txt_attention_mask.shape[1] != L_txt_calc:
+                 if txt_attention_mask.shape[1] > L_txt_calc: aligned_txt_mask = txt_attention_mask[:, :L_txt_calc]
+                 else: 
+                     padding = torch.zeros(B, L_txt_calc - txt_attention_mask.shape[1], device=txt_attention_mask.device, dtype=txt_attention_mask.dtype)
+                     aligned_txt_mask = torch.cat([txt_attention_mask, padding], dim=1)
+            txt_mask_w_padding = modify_mask_to_attend_padding(aligned_txt_mask.float(), L_txt_calc, attn_padding).bool()
+            img_component_mask = torch.ones(B, L_img_calc, device=txt_mask_w_padding.device, dtype=torch.bool)
+            combined_sequence_mask_1D_attend = torch.cat([txt_mask_w_padding, img_component_mask], dim=1)
+            mask_to_ignore_1D = ~combined_sequence_mask_1D_attend
+            combined_mask_for_attn = mask_to_ignore_1D.unsqueeze(1)
+
+        double_block_outputs = []
+        for i, blk in enumerate(self.controlnet_double_blocks):
+            img_mod_list = mod_vectors_dict.get(f"double_blocks.{i}.img_mod.lin") # Names should match
+            txt_mod_list = mod_vectors_dict.get(f"double_blocks.{i}.txt_mod.lin")
+            block_distill_vec = [img_mod_list, txt_mod_list] if img_mod_list and txt_mod_list else None
+            
+            # Checkpointing logic would be similar to Flux/ChromaModel if desired
+            current_img_features, current_txt_features = blk(
+                img=current_img_features, txt=current_txt_features, pe=pe, 
+                distill_vec=block_distill_vec, mask=combined_mask_for_attn
+            )
+            double_block_outputs.append(self.zero_convs_double[i](current_img_features)) # Or apply to both img and txt? Usually img.
+
+        single_block_outputs = []
+        if self.controlnet_single_blocks: # Only if single blocks exist
+            sb_in = torch.cat((current_txt_features, current_img_features), dim=1)
+            for i, blk in enumerate(self.controlnet_single_blocks):
+                single_mod_for_block = mod_vectors_dict.get(f"single_blocks.{i}.modulation.lin")
+                sb_in = blk(x=sb_in, pe=pe, distill_vec=single_mod_for_block, mask=combined_mask_for_attn)
+                single_block_outputs.append(self.zero_convs_single[i](sb_in))
+        
+        return double_block_outputs, single_block_outputs

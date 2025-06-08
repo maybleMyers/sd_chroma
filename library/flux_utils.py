@@ -22,7 +22,7 @@ from library.utils import load_safetensors
 
 if TYPE_CHECKING:
     from library.flux_models import Flux 
-
+DEVICE_CPU = "cpu"
 MODEL_VERSION_FLUX_V1 = "flux1" 
 
 MODEL_TYPE_FLUX_DEV = "flux_dev"
@@ -151,49 +151,74 @@ def load_flow_model(path: str, dtype: torch.dtype = torch.bfloat16, device: str 
 
     if model_type_str == "chroma":
         logger.info("Loading ChromaModel structure.")
-        params_obj = flux_models.get_chroma_model_params()
+        # Assuming flux_models has get_chroma_model_params and ChromaModel
+        params_obj = flux_models.get_chroma_model_params() 
         model = flux_models.ChromaModel(params_obj)
     else:
-        # Fallback or error for other types if this script is Chroma-only
-        # This part would contain your original logic for loading generic FLUX dev/schnell
-        logger.error(f"Unsupported model type '{model_type_str}' for this loading path. Expected 'chroma'.")
-        # For now, let's assume we only proceed if it's chroma.
-        # You might need to reinstate old logic if you want to load other FLUX types.
+        # This part is now less relevant if we are only supporting Chroma loading here.
+        # If you need to support other FLUX types, this logic would need to be reinstated and use your original Flux class.
+        logger.error(f"Attempting to load non-Chroma model type '{model_type_str}' through a Chroma-focused path. This may not be fully supported by current simplifications.")
+        # Fallback to original logic if truly needed for other types, but for now, focus on Chroma
         model_type_str_analyzed, num_double, num_single, analysis_metadata = analyze_checkpoint_state(path)
-        if model_type_str_analyzed not in model_configs:
+        if model_type_str_analyzed not in model_configs: # model_configs from your original flux_models
             raise ValueError(f"Unknown model variant: {model_type_str_analyzed}")
-        params_dto = model_configs[model_type_str_analyzed].params
-        if isinstance(params_dto, dict): # If it's a dict, assume it's for dev/schnell and needs num_blocks
-            params_dto = flux_models.flux1_dev_params(num_double, num_single) # Or Schnell based on analysis
-        model = flux_models.Flux(params_dto) # Your original Flux class
-        model_type_str = model_type_str_analyzed # Use the analyzed type
+        
+        # This assumes model_configs and the generic Flux class are still defined for non-Chroma variants
+        params_dto_generic = model_configs[model_type_str_analyzed].params
+        if isinstance(params_dto_generic, dict): 
+            params_dto_generic = flux_models.flux1_dev_params(num_double, num_single) 
+        model = flux_models.Flux(params_dto_generic) # Your original generic Flux class
+        model_type_str = model_type_str_analyzed
 
-    logger.info(f"Building Flux model variant '{model_type_str}' with inferred structure.")
+
+    logger.info(f"Building model variant '{model_type_str}'.")
     
     # Load state dict
-    logger.info(f"Loading state dict from {path} to model on device '{DEVICE_CPU}' with dtype '{str(dtype)}'") # Load to CPU first
+    logger.info(f"Loading state dict from {path} to model on device '{DEVICE_CPU}' initially, target dtype for operations: '{str(dtype)}'")
     
-    # Temporarily use your existing load_safetensors
-    sd = load_safetensors(path, DEVICE_CPU, disable_mmap=disable_mmap, dtype=None) # Load as is first
+    # Load to CPU first, then cast and move. Dtype in load_safetensors here is for final tensor dtype on target device.
+    # We want to load the raw data first.
+    sd = load_safetensors(path, DEVICE_CPU, disable_mmap=disable_mmap, dtype_load_as_is=True) # Add a flag to load as is
 
-    # Filter SD for keys that exist in the model to avoid unexpected key errors if strict=True later
     model_keys = model.state_dict().keys()
-    filtered_sd = {k: v for k, v in sd.items() if k in model_keys}
-    unexpected_keys_in_ckpt = [k for k in sd.keys() if k not in model_keys]
-    if unexpected_keys_in_ckpt:
-        logger.warning(f"Checkpoint contained unexpected keys not in model structure: {unexpected_keys_in_ckpt[:10]}...") # Log first few
+    filtered_sd = {}
+    unexpected_keys_in_ckpt_for_current_model = []
 
-    # Load with strict=False to allow missing LoRA keys etc.
+    for k, v in sd.items():
+        if k in model_keys:
+            filtered_sd[k] = v
+        else:
+            unexpected_keys_in_ckpt_for_current_model.append(k)
+            
+    if unexpected_keys_in_ckpt_for_current_model:
+        logger.warning(
+            f"Checkpoint for '{model_type_str}' contained {len(unexpected_keys_in_ckpt_for_current_model)} unexpected keys "
+            f"not in the current model structure: {unexpected_keys_in_ckpt_for_current_model[:10]}..."
+        )
+
+    # Load with strict=False to allow missing LoRA keys etc., and to handle pruned models gracefully.
     info = model.load_state_dict(filtered_sd, strict=False) 
     
     if info.missing_keys:
-        logger.warning(f"Missing keys when loading state_dict for '{model_type_str}': {info.missing_keys}")
-    # 'unexpected_keys' in `info` would be empty here because we pre-filtered `sd`.
+        # Filter out known acceptable missing keys for pruned models if necessary
+        # For Chroma, we expect final_layer.adaLN_modulation to be missing.
+        # Other missing keys might indicate a problem.
+        truly_missing_keys = [k for k in info.missing_keys if not k.startswith("final_layer.adaLN_modulation.")]
+        if truly_missing_keys:
+            logger.error(
+                f"CRITICAL Missing keys when loading state_dict for '{model_type_str}': {truly_missing_keys}. "
+                f"This indicates a potential mismatch between the checkpoint and the model definition."
+            )
+            # Optionally raise an error here if any truly critical keys are missing
+            # raise RuntimeError(f"Critical missing keys for {model_type_str}: {truly_missing_keys}")
+        elif info.missing_keys: # Only adaLN keys were missing
+            logger.info(f"Known missing keys (expected for pruned Chroma, e.g., final_layer.adaLN): {info.missing_keys}")
+
+    logger.info(f"State_dict for '{model_type_str}' processed. Missing keys (after filtering known acceptable): {len(truly_missing_keys) if 'truly_missing_keys' in locals() else len(info.missing_keys)}. Model will be moved to {device}/{dtype}.")
     
-    logger.info(f"State_dict for '{model_type_str}' loaded. Missing: {len(info.missing_keys)}. Model will be moved to {device}/{dtype}.")
+    # Now move and cast the model with loaded (or initialized) weights
     model.to(device=torch.device(device), dtype=dtype)
     
-    # Return the determined model type string and the model instance
     return model_type_str, model
 
 
@@ -230,23 +255,38 @@ def load_ae(
 
 
 def load_controlnet(
-    ckpt_path: Optional[str], flux_params_dto: flux_models.FluxParams, dtype: torch.dtype, device: Union[str, torch.device], disable_mmap: bool = False
-) -> flux_models.ControlNetFlux: 
-    logger.info("Building ControlNetFlux")
-        
-    with init_empty_weights():
-        controlnet = flux_models.ControlNetFlux(flux_params_dto)
-
-    controlnet.to_empty(device=device)
-    controlnet.to(dtype=dtype)
-
-    if ckpt_path is not None:
-        logger.info(f"Loading ControlNet state dict from {ckpt_path}")
-        sd = load_safetensors(ckpt_path, device="cpu", disable_mmap=disable_mmap, dtype=None) 
-        info = controlnet.load_state_dict(sd, strict=False) 
-        logger.info(f"Loaded ControlNet: {info}")
+    ckpt_path: Optional[str], # ControlNet might not always be loaded
+    main_model_params_dto: flux_models.FluxParams, # Pass params from the main UNet
+    dtype: torch.dtype,
+    device: Union[str, torch.device],
+    disable_mmap: bool = False,
+    controlnet_depth_mult: float = 1.0 # Multiplier for controlnet depth vs main model
+) -> Optional[flux_models.ControlNetFlux]: # Return Optional since it might not be loaded
     
-    # controlnet.to(device=device, dtype=dtype) # Already done
+    if not ckpt_path:
+        logger.info("No ControlNet checkpoint path provided. Skipping ControlNet loading.")
+        return None
+
+    logger.info("Building ControlNetFlux")
+    
+    # ControlNet often shares many architectural parameters with the main UNet
+    # but might have its own specific tweaks or depth.
+    # We pass the main model's FluxParams and a depth multiplier.
+    controlnet = flux_models.ControlNetFlux(main_model_params_dto, controlnet_depth_mult=controlnet_depth_mult)
+    
+    # Load weights if path is provided
+    logger.info(f"Loading ControlNet state dict from {ckpt_path}")
+    # Use DEVICE_CPU for initial loading if defined, else "cpu"
+    cpu_device = getattr(flux_models, 'DEVICE_CPU', "cpu") # Check if DEVICE_CPU is in flux_models
+    sd = load_safetensors(ckpt_path, device=cpu_device, disable_mmap=disable_mmap, dtype_load_as_is=True)
+    
+    # ControlNet might have a different prefix if it's a separate model.
+    # If weights are directly compatible (e.g. a fine-tuned UNet as ControlNet):
+    info = controlnet.load_state_dict(sd, strict=False) 
+    logger.info(f"Loaded ControlNet: Missing keys: {info.missing_keys}, Unexpected keys: {info.unexpected_keys}")
+    
+    controlnet.to(device=torch.device(device), dtype=dtype)
+    controlnet.eval() # ControlNets are usually in eval mode during training of other components
     return controlnet
 
 
