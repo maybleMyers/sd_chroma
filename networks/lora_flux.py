@@ -1,29 +1,20 @@
-# temporary minimum implementation of LoRA
-# FLUX doesn't have Conv2d, so we ignore it
-# TODO commonize with the original implementation
-
-# LoRA network module
-# reference:
-# https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
-# https://github.com/cloneofsimo/lora/blob/master/lora_diffusion/lora.py
-
+# networks.lora_flux.py
 import math
 import os
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple, Type, Union
-from diffusers import AutoencoderKL
-from transformers import CLIPTextModel
-import numpy as np
+# from diffusers import AutoencoderKL # Not directly used in LoRAModule
+# from transformers import CLIPTextModel # Not directly used in LoRAModule
+import numpy as np # Not directly used in LoRAModule forward but might be in other parts
 import torch
 from torch import Tensor
 import re
-from library.utils import setup_logging
-from library.sdxl_original_unet import SdxlUNet2DConditionModel
+# from library.utils import setup_logging # setup_logging is usually called once globally
+# from library.sdxl_original_unet import SdxlUNet2DConditionModel # Not used here
 
-setup_logging()
+# setup_logging() # This might reconfigure if called multiple times, ensure it's handled correctly
 import logging
-
-logger = logging.getLogger(__name__)
+logger_lora = logging.getLogger("networks.lora_flux") #
 
 def log_tensor_stats(tensor: Optional[torch.Tensor], name: str = "tensor", logger_obj: Optional[logging.Logger] = None):
     if logger_obj is None:
@@ -44,7 +35,7 @@ def log_tensor_stats(tensor: Optional[torch.Tensor], name: str = "tensor", logge
         )
     else:
         logger_obj.debug(f"{name}: None")
-        
+
 NUM_DOUBLE_BLOCKS = 19
 NUM_SINGLE_BLOCKS = 38
 
